@@ -25,13 +25,32 @@ uv run aso init         # create aso.db and apply migrations
 uv run pytest
 ```
 
-Without `uv`:
+`uv run` needs no virtualenv activation. If you'd rather type plain `aso`:
+
+```powershell
+# Windows / PowerShell — call the executable directly, no activation needed:
+.\.venv\Scripts\aso.exe list
+
+# ...or enable activation once (per-user; still blocks unsigned remote scripts):
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+.venv\Scripts\Activate.ps1
+aso list
+```
+
+```bash
+# macOS / Linux
+source .venv/bin/activate
+aso list
+```
+
+A fresh PowerShell install defaults to a `Restricted` execution policy, which
+makes `Activate.ps1` fail silently — hence the two alternatives above.
+
+Without `uv` at all:
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate        # PowerShell: .venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-aso init
 ```
 
 Configuration is read from `.env` (see `.env.example`) with defaults in
