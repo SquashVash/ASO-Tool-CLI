@@ -6,8 +6,8 @@ trends are visible, and ranks by opportunity.
 
 Single-user, local, no auth, no server. Optimized for being read and modified.
 
-> **Build status:** step 4 of 7 (scoring complete; pipeline, CLI, dashboard
-> and the ASA stub remain).
+> **Build status:** step 5 of 7. The CLI is fully usable; the Streamlit
+> dashboard and the ASA stub remain.
 > The clients, scoring, pipeline, CLI commands and dashboard land in
 > subsequent commits. Sections below marked _(pending)_ describe the design
 > those commits implement.
@@ -221,18 +221,40 @@ TTL. Raise `ASO_RATE_LIMIT_PER_MIN` at your own risk.
 
 ---
 
-## CLI _(pending)_
+## CLI
 
 ```
 aso init                                # create/upgrade the database
 aso add "candlestick patterns" --country us --tag lcp
-aso import keywords.csv
+aso import keywords.csv                 # needs a `keyword` column
 aso refresh --tag lcp --country us      # run the pipeline, write a snapshot
 aso list --sort opportunity --limit 30
 aso show "candlestick patterns"         # detail + trend + current top 10
 aso track --track-id 627114159          # your app's rank across all keywords
-aso export --format csv
+aso export --format csv -o exports/keywords.csv
 ```
+
+Every command applies pending migrations first, so `aso init` is only needed
+if you want to create the database up front.
+
+`refresh` also takes `--keyword` for a single term, `--limit` to cap a run,
+`--force` to ignore the caches, and `--verbose` to log every HTTP request.
+**It is safe to Ctrl-C**: each keyword commits on its own and every response is
+cached, so restarting only re-does the keyword that was in flight. A warm
+re-run of an already-refreshed set makes zero requests and finishes in under
+a second.
+
+Keywords are stored lowercased and whitespace-collapsed. "Day Trading" and
+"day trading" are one tracked keyword, not two — App Store search is
+case-insensitive, and storing both would split one keyword's history across
+two rows while doubling its refresh cost.
+
+`import` takes a CSV with a `keyword` column, plus optional `country` and
+`tags` (comma- or semicolon-separated). Re-importing merges tags rather than
+erroring, so an overlapping file is safe to re-run.
+
+`export` writes every component alongside the final scores, so a spreadsheet
+can re-weight them without touching this tool.
 
 ## Dashboard _(pending)_
 
@@ -258,6 +280,21 @@ varies by storefront — nothing defaults to `us` at the schema level.
 - **`serps`** — ranked results per capture. Answers "who moved into the top 10
   last month" and backs `aso track`.
 - **`http_cache`** — raw response bodies with a fetch timestamp.
+
+`aso/repository.py` holds every query, so SQL doesn't leak into the CLI,
+pipeline or dashboard. `aso/pipeline.py` orchestrates a refresh.
+
+### How a failed fetch is recorded
+
+A keyword whose SERP or hints can't be fetched still gets a snapshot row, with
+`fetch_failed = 1`, the error text, and whatever *did* succeed. The run
+continues — a 500-keyword refresh must not die on keyword 300.
+
+Partial results stay partial. If the SERP succeeds and hints fail, the
+competition score and its components are written and `search_score` stays
+NULL — never zero, never a guess. `opportunity_score` is NULL whenever either
+input is, so a half-measured keyword can't outrank a fully measured one, and
+unscored keywords sort last in every view rather than first.
 
 Migrations are an append-only list in `aso/db.py`; `aso init` applies anything
 pending. Timestamps are ISO-8601 UTC strings.
