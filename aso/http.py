@@ -165,8 +165,16 @@ class Fetcher:
             raise RuntimeError("Fetcher must be used as an async context manager")
         return self._client
 
-    async def get_text(self, url: str, params: dict[str, str]) -> str:
+    async def get_text(
+        self,
+        url: str,
+        params: dict[str, str],
+        headers: dict[str, str] | None = None,
+    ) -> str:
         """GET `url`, returning the body as text.
+
+        `headers` are merged over the client defaults — the autocomplete
+        endpoint needs an `X-Apple-Store-Front` header to return anything.
 
         Raises `FetchError` on give-up. Never returns a partial or empty result
         to paper over a failure — an empty SERP and a failed fetch must stay
@@ -177,7 +185,7 @@ class Fetcher:
         async def attempt() -> str:
             nonlocal attempts
             attempts += 1
-            return await self._request(url, params)
+            return await self._request(url, params, headers)
 
         retrying = AsyncRetrying(
             stop=stop_after_attempt(self.settings.retry_attempts),
@@ -202,12 +210,17 @@ class Fetcher:
             if attempts > 1:
                 self.retries += attempts - 1
 
-    async def _request(self, url: str, params: dict[str, str]) -> str:
+    async def _request(
+        self,
+        url: str,
+        params: dict[str, str],
+        headers: dict[str, str] | None = None,
+    ) -> str:
         await self.bucket.acquire()
         async with self.semaphore:
             self.requests_made += 1
             try:
-                response = await self.client.get(url, params=params)
+                response = await self.client.get(url, params=params, headers=headers)
             except httpx.HTTPError as exc:
                 raise TransientFetchError(
                     url, attempts=1, detail=f"{type(exc).__name__}: {exc}"

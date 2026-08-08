@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0">
+  <dict>
+    <key>title</key>
+    <string>Suggestions</string>
+    <key>hints</key>
+    <array>
+      <dict>
+        <key>term</key>
+        <string>candlestick patterns</string>
+        <key>url</key>
+        <string>https://search.itunes.apple.com/WebObjects/MZStore.woa/wa/search?clientApplication=Software&amp;src=hint&amp;submit=edit&amp;term=candlestick%20patterns</string>
+      </dict>
+      <dict>
+        <key>term</key>
+        <string>learn candlestick patterns</string>
+        <key>url</key>
+        <string>https://search.itunes.apple.com/WebObjects/MZStore.woa/wa/search?clientApplication=Software&amp;src=hint&amp;submit=edit&amp;term=learn%20candlestick%20patterns</string>
+      </dict>
+      <dict>
+        <key>term</key>
+        <string>candlestick ai</string>
+        <key>url</key>
+        <string>https://search.itunes.apple.com/WebObjects/MZStore.woa/wa/search?clientApplication=Software&amp;src=hint&amp;submit=edit&amp;term=candlestick%20ai</string>
+      </dict>
+      <dict>
+        <key>term</key>
+        <string>japanese candlestick patterns</string>
+        <key>url</key>
+        <string>https://search.itunes.apple.com/WebObjects/MZStore.woa/wa/search?clientApplication=Software&amp;src=hint&amp;submit=edit&amp;term=japanese%20candlestick%20patterns</string>
+      </dict>
+      <dict>
+        <key>term</key>
+        <string>candlestick</string>
+        <key>url</key>
+        <string>https://search.itunes.apple.com/WebObjects/MZStore.woa/wa/search?clientApplication=Software&amp;src=hint&amp;submit=edit&amp;term=candlestick</string>
+      </dict>
+      <dict>
+        <key>term</key>
+        <string>candlestick charts</string>
+        <key>url</key>
+        <string>https://search.itunes.apple.com/WebObjects/MZStore.woa/wa/search?clientApplication=Software&amp;src=hint&amp;submit=edit&amp;term=candlestick%20charts</string>
+      </dict>
+      <dict>
+        <key>term</key>
+        <string>stock candlestick</string>
+        <key>url</key>
+        <string>https://search.itunes.apple.com/WebObjects/MZStore.woa/wa/search?clientApplication=Software&amp;src=hint&amp;submit=edit&amp;term=stock%20candlestick</string>
+      </dict>
+      <dict>
+        <key>term</key>
+        <string>candlestick patterns jcp</string>
+        <key>url</key>
+        <string>https://search.itunes.apple.com/WebObjects/MZStore.woa/wa/search?clientApplication=Software&amp;src=hint&amp;submit=edit&amp;term=candlestick%20patterns%20jcp</string>
+      </dict>
+      <dict>
+        <key>term</key>
+        <string>candlestick charting</string>
+        <key>url</key>
+        <string>https://search.itunes.apple.com/WebObjects/MZStore.woa/wa/search?clientApplication=Software&amp;src=hint&amp;submit=edit&amp;term=candlestick%20charting</string>
+      </dict>
+      <dict>
+        <key>term</key>
+        <string>candlestick patterns : learn</string>
+        <key>url</key>
+        <string>https://search.itunes.apple.com/WebObjects/MZStore.woa/wa/search?clientApplication=Software&amp;src=hint&amp;submit=edit&amp;term=candlestick%20patterns%20%3A%20learn</string>
+      </dict>
+    </array>
+  </dict>
+</plist>

@@ -6,7 +6,8 @@ trends are visible, and ranks by opportunity.
 
 Single-user, local, no auth, no server. Optimized for being read and modified.
 
-> **Build status:** step 2 of 7 (iTunes client, rate limiter, SERP caching).
+> **Build status:** step 4 of 7 (scoring complete; pipeline, CLI, dashboard
+> and the ASA stub remain).
 > The clients, scoring, pipeline, CLI commands and dashboard land in
 > subsequent commits. Sections below marked _(pending)_ describe the design
 > those commits implement.
@@ -73,7 +74,7 @@ each other, not as absolute demand estimates.
 
 Three numbers per keyword per snapshot, all 0–100.
 
-### Competition (higher = harder) _(pending)_
+### Competition (higher = harder)
 
 Fetch the SERP for the keyword, take the top 10, compute six normalized
 components, combine as a weighted mean. Weights live in
@@ -89,13 +90,21 @@ _Re-scoring history_ below.
 | `comp_publisher` | 0.10 | fraction of the top 10 from sellers appearing 2+ times in the result set, × 100 |
 | `comp_breadth` | 0.10 | `min(log10(total_result_count + 1) / 2.3, 1) × 100` |
 
-`subtitle` and `averageUserRating` are frequently absent from the API response;
-missing values are excluded from medians rather than treated as zero.
+**Missing data is unknown, never zero.** A component that can't be computed is
+`None` and the remaining weights are renormalized around it, so a keyword we
+know little about doesn't look easy. Within a component, apps missing that
+field drop out of the median.
 
-### Search volume (higher = more volume) _(pending)_
+One judgement call worth knowing about: Apple reports `averageUserRating: 0.0`
+for apps nobody has rated. That's absent data dressed as a measurement, so
+**unrated apps are excluded from the stars median** — counting them would
+assert an incumbent is a 0-star app. Rating *counts* of zero are kept, because
+"nobody has rated this" is a real observation about review mass.
+
+### Search volume (higher = more volume)
 
 A prefix ladder. For keyword `k`, truncate from the right to build prefixes,
-query autocomplete for each from shortest to longest, and record:
+query autocomplete for each, and record:
 
 - **`prefix_depth`** — the shortest prefix at which `k` still appears in the
   suggestion list
@@ -108,9 +117,23 @@ searches. The score is a weighted combination of how short that prefix was and
 how high the rank was, with constants in `config.py`
 (`SEARCH_DEPTH_WEIGHT`, `SEARCH_RANK_WEIGHT`, `SEARCH_RANK_DECAY`).
 
+The ladder is walked **longest prefix first, descending**, stopping at the
+first prefix that fails to surface the keyword. Matching is monotone in
+practice — a longer, more specific prefix is likelier to surface the keyword —
+so the first miss means nothing shorter can match, and the last hit is the
+shortest matching prefix. (The original spec said to walk shortest-to-longest
+*and* to short-circuit on the first miss; only the descending walk makes that
+short-circuit meaningful, so that's what's implemented.)
+
 Capped at `SEARCH_MAX_PREFIX_QUERIES` (12) requests per keyword; longer
-keywords have their ladder sampled. The ladder short-circuits: once a prefix
-returns no match, nothing shorter is queried.
+keywords have their ladder sampled evenly, always keeping both ends. Sampling
+coarsens `prefix_depth` — the reported depth is the shortest *sampled* prefix
+that matched, which can overstate the true one. `LadderObservation.sampled`
+records when this happened.
+
+A keyword that never surfaces, even at its full length, scores
+`SEARCH_NO_MATCH_SCORE` (1.0) rather than 0 — a true zero would collapse the
+opportunity ranking, which multiplies by this number.
 
 ### Opportunity
 
@@ -139,6 +162,24 @@ from Apple.
 | Apple Search Ads API v5 | ground-truth impressions, calibration | phase 2, stubbed |
 
 No undocumented endpoints beyond those two public ones.
+
+### Two corrections to the autocomplete request shape
+
+Both found by probing the live endpoint, and both are silent failures rather
+than errors:
+
+1. **`X-Apple-Store-Front` is required.** Without it the endpoint returns
+   **200 with an empty `hints` array** — which looks exactly like "this
+   keyword has no search volume". Every suggestion depends on that header.
+2. **The `country` query parameter does nothing.** The storefront comes from
+   the header alone; sending `country=us` alongside a German storefront header
+   returns German suggestions. `aso.clients.hints.STOREFRONTS` maps ISO codes
+   to Apple's numeric storefront ids, and an unknown country **raises** rather
+   than falling back to the US — silently researching the wrong market is
+   worse than an error.
+
+`clientApplication=Software` does matter: it selects the iOS App Store index.
+`MacSoftware`, `iTunes` and `Music` all return music results.
 
 ### Rate limiting
 
