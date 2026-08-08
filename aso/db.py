@@ -117,6 +117,27 @@ MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX idx_serps_track ON serps (track_id, captured_at);
         """,
     ),
+    (
+        2,
+        "http_cache",
+        """
+        -- Raw response bodies, cached on disk rather than in memory so a
+        -- refresh run is resumable: Ctrl-C a 500-keyword run, restart it, and
+        -- everything already fetched is free.
+        --
+        -- Bodies are stored unparsed (JSON text for SERPs, XML plist for
+        -- hints) so a parser fix can be re-run against captured responses
+        -- without going back to Apple.
+        CREATE TABLE http_cache (
+            cache_key  TEXT NOT NULL PRIMARY KEY,
+            kind       TEXT NOT NULL,  -- 'serp' | 'hints'
+            body       TEXT NOT NULL,
+            fetched_at TEXT NOT NULL
+        );
+
+        CREATE INDEX idx_http_cache_kind_fetched ON http_cache (kind, fetched_at);
+        """,
+    ),
 ]
 
 

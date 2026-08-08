@@ -6,7 +6,7 @@ trends are visible, and ranks by opportunity.
 
 Single-user, local, no auth, no server. Optimized for being read and modified.
 
-> **Build status:** step 1 of 7 (scaffold, config, DB schema, migrations).
+> **Build status:** step 2 of 7 (iTunes client, rate limiter, SERP caching).
 > The clients, scoring, pipeline, CLI commands and dashboard land in
 > subsequent commits. Sections below marked _(pending)_ describe the design
 > those commits implement.
@@ -50,6 +50,17 @@ from it — the whole competition score, the stored SERPs — should be read as
 *"here is the competitive field around this term"*, never as *"here is where
 apps actually rank"*.
 
+Two specific things the endpoint does *not* give you, both confirmed against a
+live capture (`tests/fixtures/itunes_search_candlestick_us.json`):
+
+- **No subtitle.** The Search API returns no App Store subtitle field, so
+  `comp_exact_match` matches on title only. It therefore *understates*
+  competition for terms that incumbents target in their subtitle. `AppRecord`
+  parses `subtitle` defensively in case that changes.
+- **`resultCount` is a floor, not a total.** It counts what was returned, so it
+  saturates at `limit` (50). `comp_breadth` separates thin niches from crowded
+  ones but cannot tell 50 results from 5,000.
+
 Similarly, the search score is a **proxy** derived from autocomplete behaviour,
 not measured search volume. It stays a proxy until it is calibrated against
 real Apple Search Ads impression data (`scoring/search.py::calibrate()`,
@@ -72,7 +83,7 @@ _Re-scoring history_ below.
 | Component | Weight | Definition |
 |---|---|---|
 | `comp_rating_count` | 0.35 | `min(log10(median(top10 rating counts) + 1) / 6, 1) × 100` |
-| `comp_exact_match` | 0.25 | fraction of the top 10 with the full keyword in title or subtitle, × 100 |
+| `comp_exact_match` | 0.25 | fraction of the top 10 with the full keyword in title or subtitle, × 100 — title-only in practice, see the caveat above |
 | `comp_stars` | 0.10 | `median(top10 average rating) / 5 × 100` |
 | `comp_recency` | 0.10 | median days since last update, mapped 0 days → 100, 365+ days → 0 |
 | `comp_publisher` | 0.10 | fraction of the top 10 from sellers appearing 2+ times in the result set, × 100 |
@@ -129,17 +140,43 @@ from Apple.
 
 No undocumented endpoints beyond those two public ones.
 
-### Rate limiting _(pending)_
+### Rate limiting
 
 The iTunes endpoints start returning 403 above roughly 20 requests/minute per
-IP. A shared async token bucket holds all iTunes and hints traffic to 15/min
-with an `asyncio.Semaphore(3)` on top. 403/429 retry with exponential backoff
-and jitter, giving up after 4 attempts and recording a failed-fetch marker on
-the snapshot rather than aborting the run.
+IP. A single `aso.http.Fetcher` — shared by every client in a run, because the
+limit is per IP, not per client — holds all traffic to 15/min via a token
+bucket, with an `asyncio.Semaphore(3)` capping requests in flight. 403, 429,
+408, 5xx and transport errors retry with exponential backoff and jitter,
+giving up after 4 attempts. Genuine 4xx errors are not retried. Nothing is
+swallowed: on give-up a `FetchError` propagates so the pipeline can record a
+failed-fetch marker rather than aborting the run.
 
-Caching is in SQLite, not memory, so a run is resumable: SERPs 3 days, app
-metadata 7 days, autocomplete 3 days. A 500-keyword refresh takes roughly 30
-minutes unattended and is safe to Ctrl-C and restart.
+The bucket's burst size (`config.RATE_LIMIT_BURST`) is 1, i.e. strict pacing at
+one request every four seconds. That makes the semaphore mostly a backstop —
+it starts mattering if you raise the burst.
+
+### Caching
+
+In SQLite, not memory, so a run is resumable — Ctrl-C a long refresh, restart
+it, and everything already fetched is free. Raw response bodies are stored
+unparsed, so a parser fix can be replayed against captured responses without
+going back to Apple.
+
+| What | Where | TTL |
+|---|---|---|
+| SERP responses | `http_cache` (kind `serp`) | 3 days |
+| Autocomplete responses | `http_cache` (kind `hints`) | 3 days |
+| App metadata | `apps.fetched_at` | 7 days |
+
+A response that fails to parse is never cached, and a cache hit does not
+refresh `apps.fetched_at` — otherwise stale metadata would look freshly
+fetched and never be refetched.
+
+**On run time:** at 15 req/min, a 500-keyword cold refresh costs 500 SERP
+requests plus roughly 3–6 autocomplete requests each, so ~2,000–3,500 requests,
+which is 2–4 hours rather than the 30 minutes in the original spec. 30 minutes
+is about right for a *warm* re-run where most responses are still inside their
+TTL. Raise `ASO_RATE_LIMIT_PER_MIN` at your own risk.
 
 ---
 
@@ -179,6 +216,7 @@ varies by storefront — nothing defaults to `us` at the schema level.
 - **`apps`** — cached app metadata, keyed `(track_id, country)`.
 - **`serps`** — ranked results per capture. Answers "who moved into the top 10
   last month" and backs `aso track`.
+- **`http_cache`** — raw response bodies with a fetch timestamp.
 
 Migrations are an append-only list in `aso/db.py`; `aso init` applies anything
 pending. Timestamps are ISO-8601 UTC strings.

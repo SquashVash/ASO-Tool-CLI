@@ -97,13 +97,31 @@ SEARCH_MAX_HINT_RANK = 10
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+# Only these two public Apple endpoints are ever called. Deliberately no
+# lookup/rss/undocumented storefront APIs.
 ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
-ITUNES_LOOKUP_URL = "https://itunes.apple.com/lookup"
 HINTS_URL = "https://search.itunes.apple.com/WebObjects/MZSearchHints.woa/wa/hints"
 ASA_TOKEN_URL = "https://appleid.apple.com/auth/oauth2/token"
 ASA_API_BASE = "https://api.searchads.apple.com/api/v5"
 
 USER_AGENT = "aso-tool/0.1 (+local research tool)"
+
+# How many results to ask the iTunes search endpoint for. 50 is what the
+# competition score's breadth component is calibrated against; see
+# clients/itunes.py for why the API's resultCount is a floor, not a true total.
+ITUNES_SEARCH_LIMIT = 50
+
+# Token-bucket burst size. 1 means strict pacing — one request every
+# 60/rate_limit_per_min seconds, no bursting. Raising this lets a run fire N
+# requests back to back before throttling, which is exactly how you trip
+# Apple's 403 threshold at the start of a long refresh. Raise with care.
+RATE_LIMIT_BURST = 1
+
+# Backoff between retries: exponential from INITIAL, capped at MAX, with up to
+# JITTER seconds of randomness so parallel workers don't retry in lockstep.
+RETRY_INITIAL_WAIT_SECONDS = 2.0
+RETRY_MAX_WAIT_SECONDS = 60.0
+RETRY_JITTER_SECONDS = 2.0
 
 
 def _env_str(key: str, default: str) -> str:
