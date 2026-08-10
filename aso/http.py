@@ -53,6 +53,27 @@ logger = logging.getLogger(__name__)
 # rate limiting rather than for genuine authorization failures.
 TRANSIENT_STATUSES = frozenset({403, 408, 429, 500, 502, 503, 504})
 
+# For an *authenticated* API, 401/403 mean the credentials are wrong, and
+# retrying four times with backoff just spends a minute hiding a typo in a key
+# ID. Apple Search Ads uses this set instead.
+AUTHENTICATED_TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+# Query-parameter names whose values are credentials. The ASA token exchange
+# puts a signed client assertion in the query string, and `--verbose` would
+# otherwise write a usable credential into the terminal and any log file.
+SECRET_PARAMS = frozenset({"client_assertion", "client_id", "access_token"})
+
+
+def redact(params: dict[str, str] | None) -> dict[str, str] | None:
+    """Copy of `params` with credential values replaced. Used in every log line."""
+    if not params:
+        return params
+    return {
+        key: ("<redacted>" if key in SECRET_PARAMS else value)
+        for key, value in params.items()
+    }
+
 
 class FetchError(Exception):
     """A request that could not be completed, after any retries."""
@@ -180,12 +201,63 @@ class Fetcher:
         to paper over a failure — an empty SERP and a failed fetch must stay
         distinguishable downstream.
         """
+        return await self.request_text("GET", url, params=params, headers=headers)
+
+    async def post_text(
+        self,
+        url: str,
+        *,
+        params: dict[str, str] | None = None,
+        json: object | None = None,
+        data: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        transient_statuses: frozenset[int] = AUTHENTICATED_TRANSIENT_STATUSES,
+    ) -> str:
+        """POST `url`, returning the body as text.
+
+        `data` is form-encoded into the request body. Prefer it over `params`
+        for anything secret: a query string is logged by httpx at INFO, by
+        proxies, and by the server's own access log, so a credential put there
+        leaks in three places at once.
+
+        Defaults to the authenticated transient set: a 403 here is a bad
+        credential, not a rate limit, and must surface immediately.
+        """
+        return await self.request_text(
+            "POST",
+            url,
+            params=params,
+            json=json,
+            data=data,
+            headers=headers,
+            transient_statuses=transient_statuses,
+        )
+
+    async def request_text(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, str] | None = None,
+        json: object | None = None,
+        data: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        transient_statuses: frozenset[int] = TRANSIENT_STATUSES,
+    ) -> str:
         attempts = 0
 
         async def attempt() -> str:
             nonlocal attempts
             attempts += 1
-            return await self._request(url, params, headers)
+            return await self._request(
+                method,
+                url,
+                params=params,
+                json=json,
+                data=data,
+                headers=headers,
+                transient_statuses=transient_statuses,
+            )
 
         retrying = AsyncRetrying(
             stop=stop_after_attempt(self.settings.retry_attempts),
@@ -212,26 +284,33 @@ class Fetcher:
 
     async def _request(
         self,
+        method: str,
         url: str,
-        params: dict[str, str],
+        *,
+        params: dict[str, str] | None = None,
+        json: object | None = None,
+        data: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
+        transient_statuses: frozenset[int] = TRANSIENT_STATUSES,
     ) -> str:
         await self.bucket.acquire()
         async with self.semaphore:
             self.requests_made += 1
             try:
-                response = await self.client.get(url, params=params, headers=headers)
+                response = await self.client.request(
+                    method, url, params=params, json=json, data=data, headers=headers
+                )
             except httpx.HTTPError as exc:
                 raise TransientFetchError(
                     url, attempts=1, detail=f"{type(exc).__name__}: {exc}"
                 ) from exc
 
-        if response.status_code in TRANSIENT_STATUSES:
+        if response.status_code in transient_statuses:
             logger.warning(
                 "transient HTTP %s from %s (params=%s)",
                 response.status_code,
                 url,
-                params,
+                redact(params),
             )
             raise TransientFetchError(
                 url,
@@ -240,7 +319,9 @@ class Fetcher:
             )
         if response.status_code >= 400:
             # Permanent: a bad request won't get better by asking again.
-            logger.error("HTTP %s from %s (params=%s)", response.status_code, url, params)
+            logger.error(
+                "HTTP %s from %s (params=%s)", response.status_code, url, redact(params)
+            )
             raise FetchError(
                 url, status=response.status_code, detail=response.text[:200]
             )

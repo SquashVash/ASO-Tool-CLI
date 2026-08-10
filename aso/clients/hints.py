@@ -161,6 +161,29 @@ class HintList:
                 return index
         return None
 
+    def extensions_of(self, term: str) -> int:
+        """How many suggestions extend `term` without being equal to it.
+
+        Apple offers completions, never the query echoed back, so a keyword
+        that is a stem of popular longer terms is invisible to `rank_of` at
+        every rung of its ladder. `insta` is the clearest case: it has real
+        demand, no prefix of it ever surfaces it, and all ten of its
+        suggestions extend it. Counting them recovers exactly the demand the
+        ladder structurally cannot see.
+
+        Prefix match on the normalized forms, so `habit` counts
+        `habit tracker` but not `the habit burger grill`.
+        """
+        needle = normalize_term(term)
+        if not needle:
+            return 0
+        return sum(
+            1
+            for candidate in self.terms
+            if (normalized := normalize_term(candidate)) != needle
+            and normalized.startswith(needle)
+        )
+
     def __len__(self) -> int:
         return len(self.terms)
 

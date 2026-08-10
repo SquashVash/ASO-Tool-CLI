@@ -1,0 +1,33 @@
+{
+  "feed": {
+    "title": "Top Free Apps",
+    "id": "https://itunes.apple.com/us/rss/topfreeapplications/limit=100/genre=6015/json",
+    "updated": {"label": "2026-08-09T21:32:55-07:00"},
+    "entry": [
+      {
+        "im:name": {"label": "Candlestick Patterns JCP"},
+        "im:artist": {"label": "Trandll Enterprise"},
+        "id": {
+          "label": "https://apps.apple.com/us/app/id1245684460",
+          "attributes": {"im:id": "1245684460", "im:bundleId": "com.example.jcp"}
+        }
+      },
+      {
+        "im:name": {"label": "Some Unrelated Finance App"},
+        "im:artist": {"label": "Big Bank Inc."},
+        "id": {
+          "label": "https://apps.apple.com/us/app/id111111111",
+          "attributes": {"im:id": "111111111", "im:bundleId": "com.example.bank"}
+        }
+      },
+      {
+        "im:name": {"label": "Candlestick Charts"},
+        "im:artist": {"label": "Binoy Narayanan"},
+        "id": {
+          "label": "https://apps.apple.com/us/app/id6739166773",
+          "attributes": {"im:id": "6739166773", "im:bundleId": "com.example.charts"}
+        }
+      }
+    ]
+  }
+}

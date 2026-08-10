@@ -120,3 +120,92 @@ def test_transaction_rolls_back_on_error(conn: sqlite3.Connection) -> None:
                 (db.utcnow(),),
             )
     assert conn.execute("SELECT COUNT(*) FROM keywords").fetchone()[0] == 0
+
+
+# --- migration 11: comp_stars rescale, comp_exact_match reset ---------------
+
+
+def migrate_through(conn: sqlite3.Connection, last_version: int) -> None:
+    """Apply migrations up to and including `last_version`, and no further."""
+    conn.execute(db.SCHEMA_MIGRATIONS_DDL)
+    for version, name, sql in sorted(db.MIGRATIONS):
+        if version > last_version:
+            return
+        with db.transaction(conn):
+            for statement in db.split_statements(sql):
+                conn.execute(statement)
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) "
+                "VALUES (?, ?, ?)",
+                (version, name, db.utcnow()),
+            )
+
+
+def snapshot_at_version_10(
+    conn: sqlite3.Connection, *, stars: float | None, exact_match: float | None
+) -> None:
+    cur = conn.execute(
+        "INSERT INTO keywords (keyword, country, tags, active, created_at) "
+        "VALUES ('smart journal', 'us', '', 1, ?)",
+        (db.utcnow(),),
+    )
+    conn.execute(
+        "INSERT INTO snapshots (keyword_id, captured_at, comp_stars, comp_exact_match) "
+        "VALUES (?, ?, ?, ?)",
+        (cur.lastrowid, db.utcnow(), stars, exact_match),
+    )
+
+
+def test_migration_11_rescales_stored_stars_onto_the_new_ruler(tmp_path: Path) -> None:
+    """Old rows were `median / 5 * 100`. The new ruler anchors at 4.0 stars.
+
+    Without this the table would hold two incompatible scales at once, and
+    `aso rescore` would rank pre-migration keywords against post-migration ones
+    as if the numbers meant the same thing.
+    """
+    with db.session(tmp_path / "m11.db") as conn:
+        migrate_through(conn, 10)
+        # 95.7 on the old ruler is a median of 4.785 stars.
+        snapshot_at_version_10(conn, stars=95.7, exact_match=40.0)
+        # Every migration after 10, not just 11 — asserting the exact list
+        # would break every time a later one is appended, which is noise.
+        assert 11 in db.migrate(conn)
+        row = conn.execute("SELECT comp_stars FROM snapshots").fetchone()
+        assert row["comp_stars"] == pytest.approx(78.5)
+
+
+def test_migration_11_clamps_ratings_below_the_new_floor(tmp_path: Path) -> None:
+    with db.session(tmp_path / "m11floor.db") as conn:
+        migrate_through(conn, 10)
+        # 60.0 old = a median of 3.0 stars, below the 4.0 anchor.
+        snapshot_at_version_10(conn, stars=60.0, exact_match=None)
+        db.migrate(conn)
+        row = conn.execute("SELECT comp_stars FROM snapshots").fetchone()
+        assert row["comp_stars"] == pytest.approx(0.0)
+
+
+def test_migration_11_leaves_a_null_stars_null(tmp_path: Path) -> None:
+    """Unknown must survive the rescale as unknown, not become 0."""
+    with db.session(tmp_path / "m11null.db") as conn:
+        migrate_through(conn, 10)
+        snapshot_at_version_10(conn, stars=None, exact_match=None)
+        db.migrate(conn)
+        row = conn.execute("SELECT comp_stars FROM snapshots").fetchone()
+        assert row["comp_stars"] is None
+
+
+def test_migration_11_clears_exact_match_rather_than_keeping_a_stale_scale(
+    tmp_path: Path,
+) -> None:
+    """The old whole-phrase value is not recoverable, and is biased low.
+
+    Nulling it makes `combine` renormalize around it, which is this module's
+    rule for unknown data. Keeping it would make pre-migration keywords look
+    systematically easier than post-migration ones -- and look plausible.
+    """
+    with db.session(tmp_path / "m11exact.db") as conn:
+        migrate_through(conn, 10)
+        snapshot_at_version_10(conn, stars=95.7, exact_match=40.0)
+        db.migrate(conn)
+        row = conn.execute("SELECT comp_exact_match FROM snapshots").fetchone()
+        assert row["comp_exact_match"] is None

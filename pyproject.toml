@@ -9,10 +9,23 @@ dependencies = [
     "tenacity>=9.0",
     "typer>=0.12",
     "rich>=13.7",
+    "pandas>=2.0",
     "streamlit>=1.38",
     "python-dotenv>=1.0",
     "pyjwt[crypto]>=2.9",
 ]
+
+[project.optional-dependencies]
+# Durable access to Apple's keyword popularity index.
+#
+# That endpoint authenticates with a dashboard session cookie and nothing else,
+# so the only way to hold a session open across runs is to keep a real browser
+# profile. Optional because every other feature works without it, and because a
+# browser download is a big thing to impose on someone who only wants the proxy.
+#
+#   uv sync --extra browser
+#   uv run playwright install chromium
+browser = ["playwright>=1.47"]
 
 [project.scripts]
 aso = "aso.cli:app"

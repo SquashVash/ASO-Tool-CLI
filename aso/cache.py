@@ -27,8 +27,27 @@ def serp_key(term: str, country: str, limit: int) -> str:
     return f"serp:{country.lower()}:{limit}:{term.strip().casefold()}"
 
 
+def popularity_key(keyword: str, country: str) -> str:
+    """Cache key for one keyword's Apple popularity reading.
+
+    Keyed per keyword rather than per batch on purpose: batches are assembled
+    from whatever is uncached at the time, so a batch-shaped key would miss on
+    every run whose keyword set differed by one term.
+    """
+    return f"popularity:{country.lower()}:{keyword.strip().casefold()}"
+
+
 def hints_key(prefix: str, country: str) -> str:
     return f"hints:{country.lower()}:{prefix.strip().casefold()}"
+
+
+def charts_key(country: str, feed: str, genre: int) -> str:
+    """Cache key for one top-chart feed.
+
+    Keyed per (feed, genre) rather than per assembled index so that one failing
+    genre costs one request on the next run instead of invalidating all 48.
+    """
+    return f"charts:{country.lower()}:{feed}:{genre}"
 
 
 def get(conn: sqlite3.Connection, key: str, ttl_days: int) -> CachedBody | None:

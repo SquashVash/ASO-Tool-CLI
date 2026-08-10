@@ -31,7 +31,20 @@ def invoke(*args: str):
     return runner.invoke(cli.app, list(args))
 
 
+# Every top-charts feed, on any storefront. These tests care that the index
+# is built at all, not which genre a given app charts in.
+CHARTS_URL_PATTERN = r"https://itunes\.apple\.com/[a-z]{2}/rss/.+/json"
+CHARTS_BODY = (FIXTURES / "charts_finance_free_us.json").read_text(encoding="utf-8")
+
+
+def mock_charts(status: int = 200) -> None:
+    respx.get(url__regex=CHARTS_URL_PATTERN).mock(
+        return_value=httpx.Response(status, text=CHARTS_BODY if status == 200 else "nope")
+    )
+
+
 def mock_apple() -> None:
+    mock_charts()
     respx.get(ITUNES_URL).mock(return_value=httpx.Response(200, text=SERP_BODY))
     respx.get(HINTS_URL).mock(return_value=httpx.Response(200, text=HINTS_BODY))
 
@@ -182,6 +195,7 @@ def test_refresh_of_an_unknown_single_keyword_fails() -> None:
 
 @respx.mock
 def test_refresh_reports_failures_without_crashing(isolated_db: Path) -> None:
+    mock_charts(403)
     respx.get(ITUNES_URL).mock(return_value=httpx.Response(403))
     respx.get(HINTS_URL).mock(return_value=httpx.Response(403))
     invoke("add", "forex")
@@ -190,6 +204,36 @@ def test_refresh_reports_failures_without_crashing(isolated_db: Path) -> None:
     with db.session(isolated_db) as conn:
         row = repo.require_keyword(conn, "forex", "us")
         assert repo.latest_snapshot(conn, row["id"])["fetch_failed"] == 1
+
+
+# --- rescore ---------------------------------------------------------------
+
+
+def test_rescore_with_no_snapshots_says_so(isolated_db: Path) -> None:
+    result = invoke("rescore")
+    assert result.exit_code == 0
+    assert "No snapshots" in result.stdout
+
+
+@respx.mock
+def test_rescore_reports_what_it_touched(isolated_db: Path) -> None:
+    mock_apple()
+    invoke("add", "candlestick patterns")
+    invoke("refresh")
+    result = invoke("rescore")
+    assert result.exit_code == 0
+    assert "Re-scored 1 snapshot(s)" in result.stdout
+
+
+@respx.mock
+def test_rescore_makes_no_network_requests(isolated_db: Path) -> None:
+    """The whole point: retuning weights must not cost a single Apple call."""
+    mock_apple()
+    invoke("add", "candlestick patterns")
+    invoke("refresh")
+    before = respx.calls.call_count
+    invoke("rescore")
+    assert respx.calls.call_count == before
 
 
 # --- list ------------------------------------------------------------------
@@ -337,3 +381,357 @@ def test_export_of_an_empty_database_writes_a_header(tmp_path: Path) -> None:
     out = tmp_path / "empty.csv"
     assert invoke("export", "-o", str(out)).exit_code == 0
     assert "keyword" in out.read_text(encoding="utf-8")
+
+
+# --- asa / calibrate -------------------------------------------------------
+
+
+def test_asa_commands_without_credentials_explain_what_is_missing() -> None:
+    """The common first-run state. It must read as setup advice, not a crash."""
+    for args in (("asa", "whoami"), ("asa", "campaigns"), ("asa", "pull")):
+        result = invoke(*args)
+        assert result.exit_code == 1, args
+        assert "ASO_ASA_CLIENT_ID" in result.output, args
+
+
+def test_asa_pull_rejects_a_nonsense_window() -> None:
+    assert invoke("asa", "pull", "--days", "0").exit_code == 1
+
+
+def test_calibrate_with_no_measured_data_says_what_to_do(isolated_db: Path) -> None:
+    result = invoke("calibrate")
+    assert result.exit_code == 1
+    assert "asa pull" in result.output
+
+
+def test_calibrate_reports_the_fit(isolated_db: Path) -> None:
+    """Enough joined samples to actually fit."""
+    import random
+
+    rng = random.Random(3)
+    with db.session(isolated_db) as conn:
+        for i in range(40):
+            keyword = f"keyword number {i}"
+            repo.add_keyword(conn, keyword, "us")
+            row = repo.require_keyword(conn, keyword, "us")
+            depth = rng.randint(1, 6)
+            rank = rng.randint(1, 10)
+            repo.write_snapshot(
+                conn,
+                repo.SnapshotWrite(
+                    keyword_id=row["id"],
+                    captured_at="2026-08-01T00:00:00Z",
+                    search_prefix_depth=depth,
+                    search_hint_rank=rank,
+                ),
+            )
+            repo.write_demand_observations(
+                conn,
+                [
+                    repo.DemandWrite(
+                        source="asa", scale="count", keyword=keyword,
+                        country="us", value=10_000 / (depth * rank),
+                    )
+                ],
+            )
+
+    result = invoke("calibrate")
+    assert result.exit_code == 0
+    assert "SEARCH_DEPTH_DECAY" in result.output
+    assert "rank correlation" in result.output
+
+
+def test_calibrate_json_is_machine_readable(isolated_db: Path) -> None:
+    import random
+
+    rng = random.Random(5)
+    with db.session(isolated_db) as conn:
+        for i in range(40):
+            keyword = f"term {i}"
+            repo.add_keyword(conn, keyword, "us")
+            row = repo.require_keyword(conn, keyword, "us")
+            repo.write_snapshot(
+                conn,
+                repo.SnapshotWrite(
+                    keyword_id=row["id"], captured_at="2026-08-01T00:00:00Z",
+                    search_prefix_depth=rng.randint(1, 6),
+                    search_hint_rank=rng.randint(1, 10),
+                ),
+            )
+            repo.write_demand_observations(
+                conn,
+                [
+                    repo.DemandWrite(
+                        source="asa", scale="count", keyword=keyword,
+                        country="us", value=float(rng.randint(10, 50_000)),
+                    )
+                ],
+            )
+
+    result = invoke("calibrate", "--json")
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert "SEARCH_DEPTH_DECAY" in payload
+    assert payload["n_samples"] == 40
+
+
+def test_calibrate_never_writes_the_constants_itself(isolated_db: Path) -> None:
+    """A scoring constant that rewrites itself is one nobody reviews."""
+    before = Path("aso/config.py").read_text(encoding="utf-8")
+    invoke("calibrate")
+    assert Path("aso/config.py").read_text(encoding="utf-8") == before
+
+
+def test_every_db_command_applies_pending_migrations(isolated_environment: Path) -> None:
+    """A stale database must not produce a traceback.
+
+    Found by hand: `calibrate` and `asa pull` queried a table added in a later
+    migration without applying it first, so any database created before that
+    migration crashed with `no such table`.
+    """
+    from aso import db as db_module
+
+    # A database at migration 1 only — as an existing install would be.
+    conn = db_module.connect(isolated_environment)
+    with db_module.transaction(conn):
+        for statement in db_module.split_statements(db_module.MIGRATIONS[0][2]):
+            conn.execute(statement)
+        conn.execute(db_module.SCHEMA_MIGRATIONS_DDL)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (1, 'x', 'y')"
+        )
+    conn.close()
+
+    for args in (("list",), ("rescore",), ("calibrate",), ("export",)):
+        result = invoke(*args)
+        assert "no such table" not in result.output, args
+        assert not isinstance(result.exception, Exception) or isinstance(
+            result.exception, SystemExit
+        ), f"{args} raised {result.exception!r}"
+
+
+# --- import-demand ---------------------------------------------------------
+
+
+def test_import_demand_stores_and_tracks(tmp_path: Path, isolated_db: Path) -> None:
+    csv_path = tmp_path / "af.csv"
+    csv_path.write_text(
+        "Keyword,Popularity,Competitiveness,Total\n"
+        "habit tracker,59,76,250\n"
+        "streaks,50,85,250\n",
+        encoding="utf-8",
+    )
+    result = invoke("import-demand", str(csv_path), "--country", "us", "--track")
+    assert result.exit_code == 0
+    assert "2 appfigures observation(s)" in result.output
+
+    with db.session(isolated_db) as conn:
+        assert [r["source"] for r in repo.demand_sources(conn)] == ["appfigures"]
+        assert repo.get_keyword(conn, "habit tracker", "us") is not None
+
+
+def test_import_demand_without_track_leaves_keywords_alone(
+    tmp_path: Path, isolated_db: Path
+) -> None:
+    csv_path = tmp_path / "af.csv"
+    csv_path.write_text("Keyword,Popularity\nforex,42\n", encoding="utf-8")
+    assert invoke("import-demand", str(csv_path)).exit_code == 0
+    with db.session(isolated_db) as conn:
+        assert repo.list_keywords(conn) == []
+
+
+def test_import_demand_rejects_the_wrong_file(tmp_path: Path, isolated_db: Path) -> None:
+    csv_path = tmp_path / "wrong.csv"
+    csv_path.write_text("term,volume\nforex,100\n", encoding="utf-8")
+    result = invoke("import-demand", str(csv_path))
+    assert result.exit_code == 1
+
+
+def test_calibrate_names_the_source_it_used(tmp_path: Path, isolated_db: Path) -> None:
+    import random
+
+    rng = random.Random(9)
+    lines = ["Keyword,Popularity"]
+    with db.session(isolated_db) as conn:
+        for i in range(30):
+            keyword = f"keyword number {i}"
+            depth, rank = rng.randint(1, 6), rng.randint(1, 10)
+            lines.append(f"{keyword},{max(1, 100 - depth * 8 - rank * 3)}")
+            repo.add_keyword(conn, keyword, "us")
+            row = repo.require_keyword(conn, keyword, "us")
+            repo.write_snapshot(
+                conn,
+                repo.SnapshotWrite(
+                    keyword_id=row["id"], captured_at="2026-08-01T00:00:00Z",
+                    search_prefix_depth=depth, search_hint_rank=rank,
+                ),
+            )
+
+    csv_path = tmp_path / "af.csv"
+    csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert invoke("import-demand", str(csv_path)).exit_code == 0
+
+    result = invoke("calibrate")
+    assert result.exit_code == 0
+    assert "appfigures" in result.output
+    assert "SEARCH_DEPTH_DECAY" in result.output
+
+
+def test_calibrate_explains_when_demand_exists_but_nothing_joins(
+    tmp_path: Path, isolated_db: Path
+) -> None:
+    """The likely first-run failure: demand imported, but no keyword refreshed yet."""
+    csv_path = tmp_path / "af.csv"
+    csv_path.write_text(
+        "Keyword,Popularity\n" + "".join(f"kw{i},{i + 1}\n" for i in range(30)),
+        encoding="utf-8",
+    )
+    invoke("import-demand", str(csv_path), "--track")
+    result = invoke("calibrate")
+    assert result.exit_code == 1
+    assert "30 appfigures observation(s) are stored" in result.output
+    assert "aso refresh" in result.output
+
+
+def test_calibrate_rejects_an_unknown_source(tmp_path: Path, isolated_db: Path) -> None:
+    csv_path = tmp_path / "af.csv"
+    csv_path.write_text("Keyword,Popularity\nforex,42\n", encoding="utf-8")
+    invoke("import-demand", str(csv_path))
+    result = invoke("calibrate", "--source", "sensortower")
+    assert result.exit_code == 1
+    assert "appfigures" in result.output
+
+
+def test_import_demand_stratify_tracks_a_spread_not_everything(
+    tmp_path: Path, isolated_db: Path
+) -> None:
+    """Each tracked keyword costs a ladder walk, so spend the budget on spread."""
+    lines = ["Keyword,Popularity"]
+    lines += [f"floor{i},5" for i in range(40)]
+    lines += [f"real{v},{v}" for v in (10, 20, 30, 40, 50, 60)]
+    csv_path = tmp_path / "af.csv"
+    csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = invoke("import-demand", str(csv_path), "--stratify", "6")
+    assert result.exit_code == 0
+    assert "46 appfigures observation(s)" in result.output, "all demand is stored"
+
+    with db.session(isolated_db) as conn:
+        tracked = repo.list_keywords(conn)
+        assert len(tracked) == 6, "but only the sampled keywords are tracked"
+        names = {r["keyword"] for r in tracked}
+    assert sum(1 for n in names if n.startswith("floor")) <= 1, (
+        "a 40/6 floor-heavy input must not track mostly floor keywords"
+    )
+
+
+# --- non-ASCII keywords ----------------------------------------------------
+
+
+@respx.mock
+def test_a_japanese_keyword_does_not_kill_the_run(isolated_db: Path) -> None:
+    """A real crash: cp1252 stdout raised UnicodeEncodeError mid-refresh.
+
+    The pipeline guarantees fetch failures are recorded rather than fatal, but
+    this happened in the display layer, so a single unprintable keyword took
+    down an entire 56-keyword run.
+    """
+    mock_apple()
+    assert invoke("add", "ハビットトラッカー").exit_code == 0
+    assert invoke("add", "habit tracker®").exit_code == 0
+
+    result = invoke("refresh")
+    assert result.exit_code == 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+    with db.session(isolated_db) as conn:
+        assert len(repo.list_keywords(conn)) == 2
+
+
+def test_listing_and_exporting_survive_non_ascii(tmp_path: Path, isolated_db: Path) -> None:
+    invoke("add", "ハビットトラッカー")
+    assert invoke("list").exit_code == 0
+
+    out = tmp_path / "out.csv"
+    assert invoke("export", "-o", str(out)).exit_code == 0
+    assert "ハビットトラッカー" in out.read_text(encoding="utf-8")
+
+
+def test_show_renders_a_non_ascii_keyword(isolated_db: Path) -> None:
+    invoke("add", "ハビットトラッカー")
+    assert invoke("show", "ハビットトラッカー").exit_code == 0
+
+
+# --- check -----------------------------------------------------------------
+
+
+@respx.mock
+def test_check_scores_without_tracking(isolated_db: Path) -> None:
+    """The whole point: answer "is this worth tracking?" without committing."""
+    mock_apple()
+    result = invoke("check", "candlestick patterns")
+    assert result.exit_code == 0
+    assert "opportunity" in result.output
+
+    with db.session(isolated_db) as conn:
+        assert repo.list_keywords(conn) == [], "no keyword row"
+        assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM serps").fetchone()[0] == 0
+
+
+@respx.mock
+def test_check_shows_components_and_the_serp(isolated_db: Path) -> None:
+    mock_apple()
+    result = invoke("check", "candlestick patterns")
+    assert "comp_rating_count" in result.output
+    assert "search_prefix_depth" in result.output
+    assert "NOT App Store rank" in result.output
+
+
+@respx.mock
+def test_check_agrees_with_refresh_on_the_same_keyword(isolated_db: Path) -> None:
+    """Both paths must run identical scoring — only persistence differs."""
+    mock_apple()
+    checked = json.loads(invoke("check", "candlestick patterns", "--json").stdout)
+
+    invoke("add", "candlestick patterns")
+    invoke("refresh")
+    with db.session(isolated_db) as conn:
+        row = repo.require_keyword(conn, "candlestick patterns", "us")
+        stored = repo.latest_snapshot(conn, row["id"])
+
+    for field in ("search_score", "competition_score", "opportunity_score",
+                  "comp_rating_count", "search_prefix_depth", "search_hint_rank"):
+        assert checked[field] == pytest.approx(stored[field]), field
+
+
+@respx.mock
+def test_check_json_marks_the_result_as_untracked(isolated_db: Path) -> None:
+    mock_apple()
+    payload = json.loads(invoke("check", "forex", "--json").stdout)
+    assert payload["tracked"] is False
+    assert payload["keyword"] == "forex"
+    assert payload["country"] == "us"
+
+
+@respx.mock
+def test_check_reports_a_failure_without_crashing(isolated_db: Path) -> None:
+    mock_charts(403)
+    respx.get(ITUNES_URL).mock(return_value=httpx.Response(403))
+    respx.get(HINTS_URL).mock(return_value=httpx.Response(403))
+    result = invoke("check", "forex")
+    assert result.exit_code == 0
+    assert "failed" in result.output or "serp" in result.output
+
+
+def test_check_rejects_a_blank_keyword() -> None:
+    assert invoke("check", "   ").exit_code == 1
+
+
+@respx.mock
+def test_check_says_it_did_not_track(isolated_db: Path) -> None:
+    """A tool that scores silently without storing must say so."""
+    mock_apple()
+    result = invoke("check", "forex")
+    assert "Not tracked" in result.output
+    assert "aso add" in result.output

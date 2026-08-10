@@ -312,3 +312,128 @@ def test_track_can_be_scoped_to_a_storefront(conn: sqlite3.Connection) -> None:
         repo.write_serp(conn, keyword_id, "2026-06-01T00:00:00Z", [111])
     assert len(repo.track_positions(conn, 111)) == 2
     assert len(repo.track_positions(conn, 111, country="de")) == 1
+
+
+# --- movers ----------------------------------------------------------------
+
+
+def mover_snap(conn, keyword_id, captured_at, opportunity, search=50.0, competition=50.0):
+    return repo.write_snapshot(
+        conn,
+        repo.SnapshotWrite(
+            keyword_id=keyword_id,
+            captured_at=captured_at,
+            search_score=search,
+            competition_score=competition,
+            opportunity_score=opportunity,
+        ),
+    )
+
+
+def days_ago(days: int) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def test_movers_reports_the_change_since_the_cutoff(conn) -> None:
+    repo.add_keyword(conn, "forex", "us")
+    row = repo.require_keyword(conn, "forex", "us")
+    mover_snap(conn, row["id"], days_ago(10), 20.0)
+    mover_snap(conn, row["id"], days_ago(0), 35.0)
+
+    movers = repo.score_movers(conn, days=7)
+    assert len(movers) == 1
+    assert movers[0]["opportunity_score"] == pytest.approx(35.0)
+    assert movers[0]["baseline_opportunity"] == pytest.approx(20.0)
+    assert movers[0]["opportunity_delta"] == pytest.approx(15.0)
+
+
+def test_movers_baseline_is_the_cutoff_not_merely_the_previous_snapshot(conn) -> None:
+    """Two refreshes in one afternoon must not read as a week-over-week move."""
+    repo.add_keyword(conn, "forex", "us")
+    row = repo.require_keyword(conn, "forex", "us")
+    mover_snap(conn, row["id"], days_ago(30), 10.0)
+    mover_snap(conn, row["id"], days_ago(0), 40.0)
+    mover_snap(conn, row["id"], days_ago(0), 41.0)
+
+    movers = repo.score_movers(conn, days=7)
+    assert movers[0]["baseline_opportunity"] == pytest.approx(10.0), (
+        "the baseline must be the snapshot older than the cutoff"
+    )
+    assert movers[0]["opportunity_delta"] == pytest.approx(31.0)
+
+
+def test_a_keyword_with_no_old_enough_snapshot_has_a_null_delta(conn) -> None:
+    """Zero would claim 'measured, didn't move'. This is 'not measured then'."""
+    repo.add_keyword(conn, "forex", "us")
+    row = repo.require_keyword(conn, "forex", "us")
+    mover_snap(conn, row["id"], days_ago(1), 40.0)
+
+    movers = repo.score_movers(conn, days=7)
+    assert movers[0]["opportunity_delta"] is None
+    assert movers[0]["baseline_opportunity"] is None
+
+
+def test_a_single_snapshot_older_than_the_cutoff_still_has_no_delta(conn) -> None:
+    """The baseline and the latest are the same row; comparing gives nothing."""
+    repo.add_keyword(conn, "forex", "us")
+    row = repo.require_keyword(conn, "forex", "us")
+    mover_snap(conn, row["id"], days_ago(30), 40.0)
+
+    movers = repo.score_movers(conn, days=7)
+    assert movers[0]["opportunity_delta"] is None
+
+
+def test_movers_sorts_by_absolute_movement(conn) -> None:
+    """A big drop is as interesting as a big rise."""
+    for keyword, then, now in (("a", 20.0, 25.0), ("b", 60.0, 20.0), ("c", 30.0, 32.0)):
+        repo.add_keyword(conn, keyword, "us")
+        row = repo.require_keyword(conn, keyword, "us")
+        mover_snap(conn, row["id"], days_ago(10), then)
+        mover_snap(conn, row["id"], days_ago(0), now)
+
+    movers = repo.score_movers(conn, days=7)
+    assert [m["keyword"] for m in movers] == ["b", "a", "c"]
+
+
+def test_movers_respects_country_and_tag_filters(conn) -> None:
+    for keyword, country, tags in (("forex", "us", "fx"), ("forex", "de", "fx"),
+                                   ("gold", "us", "metal")):
+        repo.add_keyword(conn, keyword, country, tags)
+        row = repo.require_keyword(conn, keyword, country)
+        mover_snap(conn, row["id"], days_ago(10), 20.0)
+        mover_snap(conn, row["id"], days_ago(0), 30.0)
+
+    assert len(repo.score_movers(conn, days=7, country="us")) == 2
+    assert len(repo.score_movers(conn, days=7, tag="fx")) == 2
+    assert len(repo.score_movers(conn, days=7, country="us", tag="fx")) == 1
+
+
+def test_movers_skips_failed_snapshots(conn) -> None:
+    """A failed fetch has no opportunity score and is not a movement."""
+    repo.add_keyword(conn, "forex", "us")
+    row = repo.require_keyword(conn, "forex", "us")
+    repo.write_snapshot(
+        conn,
+        repo.SnapshotWrite(
+            keyword_id=row["id"], captured_at=days_ago(0),
+            fetch_failed=True, fetch_error="hints: HTTP 403",
+        ),
+    )
+    assert repo.score_movers(conn, days=7) == []
+
+
+def test_movers_excludes_inactive_keywords(conn) -> None:
+    repo.add_keyword(conn, "forex", "us")
+    row = repo.require_keyword(conn, "forex", "us")
+    mover_snap(conn, row["id"], days_ago(10), 20.0)
+    mover_snap(conn, row["id"], days_ago(0), 30.0)
+    repo.set_active(conn, row["id"], False)
+    assert repo.score_movers(conn, days=7) == []
+
+
+def test_movers_on_an_empty_database(conn) -> None:
+    assert repo.score_movers(conn) == []

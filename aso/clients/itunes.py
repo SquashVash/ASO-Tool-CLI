@@ -1,7 +1,7 @@
 """iTunes Search API client — the competitor set behind the competition score.
 
     GET https://itunes.apple.com/search
-        ?term={keyword}&entity=software&country={cc}&limit=50
+        ?term={keyword}&entity=software&country={cc}&limit=200
 
 READ THIS BEFORE TRUSTING THE ORDERING
 --------------------------------------
@@ -29,9 +29,12 @@ Two further honesty notes about the response shape:
   `comp_exact_match` component degrades to a title-only match. That
   understates competition for terms incumbents target in the subtitle.
 * **`resultCount` is a floor, not a total.** It counts what was returned, so
-  it saturates at `limit` (50). The `comp_breadth` component therefore
-  separates thin niches from crowded ones but cannot distinguish "50 results"
-  from "5000 results".
+  it saturates at `limit`, which is now 200 — the API's documented maximum. The
+  `comp_breadth` component therefore separates thin niches from crowded ones
+  but still cannot distinguish "200 results" from "5000 results". The
+  difference from before is that 200 is a wide enough field for most keywords
+  to land inside it rather than pinned against the ceiling; see
+  `config.ITUNES_SEARCH_LIMIT`.
 """
 
 from __future__ import annotations

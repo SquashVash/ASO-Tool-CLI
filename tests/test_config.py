@@ -22,7 +22,23 @@ def test_competition_weight_keys_match_snapshot_columns() -> None:
 
 
 def test_search_weights_sum_to_one() -> None:
-    assert config.SEARCH_DEPTH_WEIGHT + config.SEARCH_RANK_WEIGHT == pytest.approx(1.0)
+    """Every component the scorer knows about, or the renormalization lies.
+
+    `score_from_observations` divides by the weights of the components it
+    actually has, so a set summing to less than 1 would silently rescale every
+    score upward and still look self-consistent.
+    """
+    from aso.scoring.search import COMPONENT_NAMES
+
+    weights = {
+        "depth": config.SEARCH_DEPTH_WEIGHT,
+        "savings": config.SEARCH_SAVINGS_WEIGHT,
+        "rank": config.SEARCH_RANK_WEIGHT,
+        "extensions": config.SEARCH_EXTENSIONS_WEIGHT,
+        "rating_mass": config.SEARCH_RATING_MASS_WEIGHT,
+    }
+    assert set(weights) == set(COMPONENT_NAMES), "a component has no weight here"
+    assert sum(weights.values()) == pytest.approx(1.0)
 
 
 def test_settings_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -49,3 +65,20 @@ def test_asa_is_unconfigured_by_default(monkeypatch: pytest.MonkeyPatch) -> None
     ):
         monkeypatch.delenv(key, raising=False)
     assert config.Settings.from_env().asa.configured is False
+
+
+def test_rating_mass_is_never_scored_on_both_sides() -> None:
+    """It is demand now. Leaving it in competition would cancel against itself.
+
+    `opportunity = search * (100 - competition)`, so a component carrying
+    weight in both terms partly undoes its own effect — and the direction it
+    used to have was backwards: the strongest predictor of demand was reducing
+    the score of the highest-traffic keywords.
+    """
+    if config.SEARCH_RATING_MASS_WEIGHT > 0:
+        assert config.COMPETITION_WEIGHTS["comp_rating_count"] == 0.0
+
+
+def test_competition_still_has_weight_left() -> None:
+    """Zeroing rating mass must not have zeroed the whole competition score."""
+    assert sum(config.COMPETITION_WEIGHTS.values()) > 0

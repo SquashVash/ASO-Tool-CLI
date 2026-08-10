@@ -11,3 +11,8 @@ __pycache__/
 exports/
 *.p8
 *.pem
+.streamlit/credentials.toml
+
+# Saved Apple Ads browser session. This is a credential — it holds live
+# session cookies for an account that can spend money.
+.apple-session/
