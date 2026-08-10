@@ -30,16 +30,33 @@ sudo rm /tmp/.env /tmp/asa-private-key.pem
 frozen calibration corpus all ship with the checkout, so a fresh clone scores
 identically to your laptop with no copying.
 
-The one file worth copying is your own keyword list, which starts empty:
+### Runtime state goes OUTSIDE the checkout
+
+The same files the repo ships are written at runtime: `refresh` rewrites
+`keywords.json`, `asa pull` and `apple pull` rewrite the observations, and
+`bridge` rewrites the fits. Left in `/opt/aso/data`, the first nightly refresh
+dirties the working tree and the next `git pull` refuses to fast-forward.
+
+So point `ASO_DATA_DIR` at a state directory and seed it once:
 
 ```bash
-scp data/keywords.json root@<host>:/tmp/keywords.json
-sudo install -o aso -g aso -m 644 /tmp/keywords.json /opt/aso/data/keywords.json
-sudo rm /tmp/keywords.json
+sudo install -d -o aso -g aso -m 755 /var/lib/aso
+sudo -u aso cp /opt/aso/data/*.json /var/lib/aso/
+echo 'ASO_DATA_DIR=/var/lib/aso' | sudo tee -a /opt/aso/.env
+sudo systemctl restart aso-api.service
 ```
 
-Stop the API before replacing it. A refresh writes the whole file at once, so
-overwriting it under a running job would lose that job's results.
+`aso-api.service` already grants `ReadWritePaths=/opt/aso`; add `/var/lib/aso`
+to that line or the hardened unit will make the directory read-only.
+
+After this the checkout is pure code and `git pull` is always clean. Upgrading
+the shipped calibration data becomes a deliberate copy rather than something a
+pull does behind your back — which is the right way round, since overwriting
+`/var/lib/aso/keywords.json` would destroy your keyword list.
+
+Stop the API before replacing any file under `/var/lib/aso`. A refresh writes
+the whole keyword list at once, so overwriting it under a running job loses
+that job's results.
 
 ## Units
 
