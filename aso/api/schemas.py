@@ -127,6 +127,55 @@ class DeleteResponse(BaseModel):
     serps: int
 
 
+class LookupRequest(BaseModel):
+    keyword: str
+    country: str
+    force: bool = False
+
+
+class LookupResponse(BaseModel):
+    keyword: str
+    country: str
+    search_score: float | None
+    search_score_proxy: float | None
+    search_source: str | None
+    competition_score: float | None
+    competition_score_raw: float | None
+    opportunity_score: float | None
+    components: dict[str, float | None]
+    tracked: bool
+    # Where this score falls among tracked keywords, 0-100. None when nothing
+    # is tracked or scoring failed: an unscored keyword has no rank, and 0
+    # would read as "the worst one".
+    percentile: float | None
+    compared_against: int
+    # 0 means every response came from the HTTP cache.
+    requests_made: int
+    failed: bool
+    error: str | None
+
+    @classmethod
+    def from_result(cls, result) -> "LookupResponse":
+        outcome = result.scored.outcome
+        return cls(
+            keyword=outcome.keyword,
+            country=outcome.country,
+            search_score=outcome.search_score,
+            search_score_proxy=outcome.search_score_proxy,
+            search_source=outcome.search_source,
+            competition_score=outcome.competition_score,
+            competition_score_raw=outcome.competition_score_raw,
+            opportunity_score=outcome.opportunity_score,
+            components=result.scored.components,
+            tracked=result.tracked,
+            percentile=result.percentile,
+            compared_against=result.compared_against,
+            requests_made=result.requests_made,
+            failed=outcome.failed,
+            error=outcome.error,
+        )
+
+
 class MoverRow(BaseModel):
     """A null delta means *not measured then*, never *did not move*."""
 
