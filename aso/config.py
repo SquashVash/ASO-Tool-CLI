@@ -844,6 +844,12 @@ class Settings:
     db_path: Path = PROJECT_ROOT / "aso.db"
     default_country: str = "us"
 
+    # The API binds loopback because this tool has no authentication. Other
+    # services on the same host can reach it; nothing else can. Reaching it
+    # from elsewhere is an SSH tunnel, not a config change.
+    api_host: str = "127.0.0.1"
+    api_port: int = 8081
+
     # Rate limiting, shared across every iTunes + hints call in a process.
     rate_limit_per_min: int = 15
     max_concurrency: int = 3
@@ -895,6 +901,8 @@ class Settings:
         return cls(
             db_path=db_path,
             default_country=_env_str("ASO_DEFAULT_COUNTRY", "us").lower(),
+            api_host=_env_str("ASO_API_HOST", "127.0.0.1"),
+            api_port=_env_int("ASO_API_PORT", 8081),
             rate_limit_per_min=_env_int("ASO_RATE_LIMIT_PER_MIN", 15),
             max_concurrency=_env_int("ASO_MAX_CONCURRENCY", 3),
             http_timeout_seconds=_env_float("ASO_HTTP_TIMEOUT_SECONDS", 20.0),
