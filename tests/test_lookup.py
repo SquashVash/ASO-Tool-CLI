@@ -172,3 +172,64 @@ def test_lookup_normalizes_country_case(monkeypatch) -> None:
 
     lookup_module.lookup("forex", "US")
     assert seen["country"] == "us"
+
+
+async def test_lookup_async_uses_a_caller_supplied_fetcher(monkeypatch) -> None:
+    """The API owns one Fetcher for its process. A lookup that built its own
+    would draw from a second token bucket against the same per-IP limit."""
+    from aso import db, pipeline
+
+    from .test_http import fast_fetcher
+
+    seen: dict[str, object] = {}
+
+    async def fake_score(keyword, country, *, itunes, hints, **kwargs):
+        seen["itunes_fetcher"] = itunes.fetcher
+        seen["hints_fetcher"] = hints.fetcher
+        seen["charts"] = kwargs.get("charts")
+        outcome = pipeline.KeywordOutcome(
+            keyword_id=0, keyword=keyword, country=country
+        )
+        return pipeline.ScoredKeyword(
+            outcome=outcome, comp_result=None, observation=None, serp=None
+        )
+
+    monkeypatch.setattr(lookup_module.pipeline, "score_keyword", fake_score)
+    with db.session() as conn:
+        db.migrate(conn)
+
+    async with fast_fetcher() as fetcher:
+        await lookup_module.lookup_async("forex", "us", fetcher=fetcher)
+
+    assert seen["itunes_fetcher"] is fetcher
+    assert seen["hints_fetcher"] is fetcher
+
+
+async def test_lookup_async_passes_the_chart_index_through(monkeypatch) -> None:
+    """Without it `comp_app_power` is None and `combine()` renormalizes over
+    the rest — and that component carries 0.625 of the fitted weight."""
+    from aso import db, pipeline
+    from aso.clients.charts import ChartIndex
+
+    from .test_http import fast_fetcher
+
+    seen: dict[str, object] = {}
+
+    async def fake_score(keyword, country, *, itunes, hints, **kwargs):
+        seen["charts"] = kwargs.get("charts")
+        outcome = pipeline.KeywordOutcome(
+            keyword_id=0, keyword=keyword, country=country
+        )
+        return pipeline.ScoredKeyword(
+            outcome=outcome, comp_result=None, observation=None, serp=None
+        )
+
+    monkeypatch.setattr(lookup_module.pipeline, "score_keyword", fake_score)
+    with db.session() as conn:
+        db.migrate(conn)
+
+    index = ChartIndex(country="us", ranks={111: 3})
+    async with fast_fetcher() as fetcher:
+        await lookup_module.lookup_async("forex", "us", fetcher=fetcher, charts=index)
+
+    assert seen["charts"] is index
