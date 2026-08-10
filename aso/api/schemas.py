@@ -176,6 +176,32 @@ class LookupResponse(BaseModel):
         )
 
 
+class RefreshRequest(BaseModel):
+    tag: str | None = None
+    country: str | None = None
+    limit: int | None = None
+    force: bool = False
+    include_inactive: bool = False
+
+
+class JobResponse(BaseModel):
+    id: str
+    kind: str
+    status: str
+    started_at: str
+    finished_at: str | None
+    params: dict
+    done: int
+    total: int | None
+    current: str | None
+    result: dict | None
+    error: str | None
+
+    @classmethod
+    def from_job(cls, job) -> "JobResponse":
+        return cls(**{key: getattr(job, key) for key in cls.model_fields})
+
+
 class MoverRow(BaseModel):
     """A null delta means *not measured then*, never *did not move*."""
 
