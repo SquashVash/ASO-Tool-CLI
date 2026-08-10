@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from ..clients.charts import ChartIndex, ChartsClient
 from ..config import settings
 from ..http import Fetcher
+from .jobs import JobRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ class AppState:
     # week-old index from memory and never notice.
     chart_indexes: dict[tuple[str, str], ChartIndex] = field(default_factory=dict)
     chart_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    jobs: JobRegistry = field(default_factory=JobRegistry)
 
     async def chart_index(self, conn: sqlite3.Connection, country: str) -> ChartIndex:
         """The storefront's chart index, built at most once per country per day.

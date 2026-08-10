@@ -25,9 +25,14 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     init_db()
     async with Fetcher(settings) as fetcher:
-        app.state.aso = AppState(fetcher=fetcher)
+        state = AppState(fetcher=fetcher)
+        app.state.aso = state
         logger.info("aso api ready, rate limit %s/min", settings.rate_limit_per_min)
-        yield
+        try:
+            yield
+        finally:
+            # SIGTERM during a three-hour refresh must not orphan the task.
+            await state.jobs.shutdown()
 
 
 def create_app() -> FastAPI:
