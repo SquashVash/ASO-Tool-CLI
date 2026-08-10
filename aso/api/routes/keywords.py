@@ -41,13 +41,21 @@ def list_keywords(
     include_inactive: bool = False,
     include_unscored: bool = True,
 ) -> list[KeywordScore]:
+    # `limit` truncates in SQL before the `keyword` filter ever runs in Python.
+    # Passing it straight through would make id-resolution depend on where the
+    # match happens to fall in the sorted, limited window — a caller doing
+    # `?keyword=foo&limit=1` could get an empty result even though "foo" is
+    # tracked, just because something else sorted ahead of it. So when
+    # `keyword` is set, fetch the full candidate set and apply `limit` after
+    # filtering instead.
+    sql_limit = None if keyword is not None else limit
     try:
         rows = repository.latest_scores(
             conn,
             tag=tag,
             country=country,
             sort=sort,
-            limit=limit,
+            limit=sql_limit,
             active_only=not include_inactive,
             include_unscored=include_unscored,
         )
@@ -57,6 +65,8 @@ def list_keywords(
     if keyword is not None:
         wanted = repository.normalize_keyword(keyword)
         rows = [row for row in rows if row["keyword"] == wanted]
+        if limit is not None:
+            rows = rows[:limit]
     return [KeywordScore.from_row(row) for row in rows]
 
 

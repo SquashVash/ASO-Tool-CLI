@@ -59,6 +59,21 @@ def test_list_filters_by_keyword_so_a_caller_can_resolve_an_id(client):
     assert [row["keyword"] for row in body] == ["forex"]
 
 
+def test_list_keyword_filter_resolves_regardless_of_limit(client):
+    """The keyword filter is how a caller holding only the string finds an id.
+
+    That must hold even when `limit` is combined with it: a keyword with a low
+    opportunity score should not become unresolvable just because `limit`
+    truncated the sorted list before the filter got a chance to look for it.
+    """
+    seed(keyword="candlestick patterns", opportunity=90.0)
+    seed(keyword="forex", opportunity=10.0)
+    body = client.get(
+        "/keywords", params={"keyword": "forex", "limit": 1}
+    ).json()
+    assert [row["keyword"] for row in body] == ["forex"]
+
+
 def test_detail_carries_components_with_their_weights(client):
     keyword_id = seed()
     body = client.get(f"/keywords/{keyword_id}").json()
