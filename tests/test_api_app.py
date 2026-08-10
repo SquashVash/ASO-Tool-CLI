@@ -14,7 +14,7 @@ from aso.api.app import create_app
 from . import conftest
 
 
-def test_health_reports_schema_and_counts(tmp_path):
+def test_health_reports_schema_and_counts():
     db.init_db()
     with db.session() as conn:
         from aso import repository as repo

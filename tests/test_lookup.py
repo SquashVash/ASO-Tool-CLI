@@ -186,7 +186,6 @@ async def test_lookup_async_uses_a_caller_supplied_fetcher(monkeypatch) -> None:
     async def fake_score(keyword, country, *, itunes, hints, **kwargs):
         seen["itunes_fetcher"] = itunes.fetcher
         seen["hints_fetcher"] = hints.fetcher
-        seen["charts"] = kwargs.get("charts")
         outcome = pipeline.KeywordOutcome(
             keyword_id=0, keyword=keyword, country=country
         )

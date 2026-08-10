@@ -48,7 +48,10 @@ def list_keywords(
         ),
     ),
     sort: str = "opportunity",
-    limit: int | None = None,
+    # `ge=1`: `repository` passes a None limit to SQL as `LIMIT -1`, i.e.
+    # unlimited, and 0 or a negative value lands in the same place — a caller
+    # asking for zero rows would get every row.
+    limit: int | None = Query(None, ge=1),
     include_inactive: bool = False,
     include_unscored: bool = True,
 ) -> list[KeywordScore]:
@@ -109,7 +112,7 @@ def keyword_detail(
 @router.get("/keywords/{keyword_id}/history", response_model=list[SnapshotRow])
 def keyword_history(
     keyword_id: int,
-    limit: int | None = None,
+    limit: int | None = Query(None, ge=1),  # same `LIMIT -1` hazard as /keywords
     conn: sqlite3.Connection = Depends(get_conn),
 ) -> list[SnapshotRow]:
     _require_keyword_row(conn, keyword_id)
@@ -120,7 +123,7 @@ def keyword_history(
 @router.get("/keywords/{keyword_id}/serp", response_model=list[SerpRow])
 def keyword_serp(
     keyword_id: int,
-    limit: int = 10,
+    limit: int = Query(10, ge=1),  # 0 reaches SQL as `LIMIT -1`, i.e. unlimited
     conn: sqlite3.Connection = Depends(get_conn),
 ) -> list[SerpRow]:
     _require_keyword_row(conn, keyword_id)

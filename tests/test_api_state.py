@@ -72,6 +72,28 @@ async def test_an_index_that_loaded_nothing_is_returned_but_not_cached(monkeypat
     assert rebuilt is cached, "the index that did load is cached as usual"
 
 
+async def test_a_stale_dated_index_is_evicted_when_a_new_day_is_built(monkeypatch):
+    """Yesterday's index is unreachable — the key carries the date — and each
+    one holds ~4,800 ranks. The API process is `Restart=always` with no
+    periodic restart, so nothing else would ever free them."""
+    from aso.api import state as state_module
+
+    charts = CountingCharts()
+    monkeypatch.setattr(state_module, "ChartsClient", lambda *a, **kw: charts)
+
+    app_state = AppState(fetcher=object())
+    stale = ("us", "2020-01-01")
+    app_state.chart_indexes[stale] = ChartIndex(
+        country="us", ranks={1: 1}, charts_loaded=48
+    )
+    db.init_db()
+    with db.session() as conn:
+        await app_state.chart_index(conn, "gb")
+
+    assert stale not in app_state.chart_indexes
+    assert len(app_state.chart_indexes) == 1
+
+
 async def test_chart_index_is_keyed_by_country(monkeypatch):
     from aso.api import state as state_module
 

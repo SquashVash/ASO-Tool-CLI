@@ -2700,8 +2700,10 @@ journalctl -u aso-api -f
 ## The optional browser extra
 
 Only `POST /popularity/pull` needs it, and it adds ~400MB plus apt
-dependencies. `/popularity/pull` returns 503 with an explanation until then, so
-this blocks nothing:
+dependencies. Until you opt in with `ASO_APPLE_POPULARITY_ENABLED=true`, that
+route returns 503 with an explanation, so this blocks nothing. With the flag on
+but the extra missing, the pull starts and the job fails with a message naming
+the install command:
 
 ```bash
 cd /opt/aso && sudo -u aso uv sync --extra browser
@@ -2799,6 +2801,15 @@ the snapshots in `aso.db`, plus journald. The registry keeps the last 50.
 One job per kind: a second `POST /refresh` while one is running gets 409, since
 two runs writing snapshots for an overlapping set is simply wrong. A refresh
 and an ASA pull together are fine.
+
+`POST /jobs/{id}/cancel` returns the job already marked `cancelled`, with its
+partial `done` count intact — the route yields to the event loop once so the
+cancelled task can stamp its own terminal status before the response is built.
+Snapshots the run already committed stay committed.
+
+`POST /refresh` rejects `limit` below 1. Zero would select nothing and then
+report "no keywords match that filter", which is false — keywords matched, the
+limit discarded them.
 
 **Run one worker.** `aso serve` has no `--workers` flag on purpose: two workers
 would mean two token buckets and two job registries behind one URL.

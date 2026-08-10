@@ -27,6 +27,30 @@ def test_popularity_pull_is_503_when_the_endpoint_is_not_enabled(client):
     assert "apple_popularity_enabled" in response.json()["detail"]
 
 
+def test_popularity_pull_rejects_limit_zero_at_validation(client, monkeypatch):
+    """Not the "No keywords match that filter" 422, which would be a lie.
+
+    `limit=0` slices every matched keyword away, so the handler's emptiness
+    check fires and blames the filter for something the limit did. `ge=1`
+    catches it one layer earlier and says which field is wrong.
+    """
+    from aso.api.routes import jobs as jobs_routes
+
+    monkeypatch.setattr(
+        jobs_routes,
+        "settings",
+        dataclasses.replace(config.settings, apple_popularity_enabled=True),
+    )
+
+    response = client.post("/popularity/pull", json={"country": "us", "limit": 0})
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "limit"]
+    assert "greater than or equal to 1" in detail[0]["msg"]
+    assert "No keywords match" not in str(detail)
+
+
 def test_asa_pull_starts_a_job(client, monkeypatch):
     from aso import pipeline
     from aso.api.routes import jobs as jobs_routes

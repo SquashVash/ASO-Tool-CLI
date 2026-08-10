@@ -208,13 +208,19 @@ class JobResponse(BaseModel):
 
 
 class ASAPullRequest(BaseModel):
-    days: int | None = None  # defaults to ASA_DEFAULT_LOOKBACK_DAYS
+    # `ge=1`: the handler computes `start = today - days`, so a negative value
+    # makes `start > end` and sends Apple a window that runs backwards. 0 asks
+    # for an empty window, which is never what a caller means.
+    days: int | None = Field(None, ge=1)  # defaults to ASA_DEFAULT_LOOKBACK_DAYS
 
 
 class PopularityPullRequest(BaseModel):
     country: str
     tag: str | None = None
-    limit: int | None = None
+    # `ge=1`, same as `RefreshRequest.limit`: 0 slices every matched keyword
+    # away and then reports "No keywords match that filter", which is false.
+    # Negative slices from the end, silently returning keywords not asked for.
+    limit: int | None = Field(None, ge=1)
 
 
 class RescoreResponse(BaseModel):

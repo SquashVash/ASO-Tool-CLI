@@ -59,9 +59,16 @@ async def test_different_kinds_may_run_concurrently():
 
     refresh_job = await registry.start("refresh", blocking)
     pull_job = await registry.start("asa_pull", blocking)
+
+    assert registry.running("refresh") is refresh_job
+    assert registry.running("asa_pull") is pull_job
+
     gate.set()
     await registry.wait(refresh_job.id)
     await registry.wait(pull_job.id)
+
+    assert registry.get(refresh_job.id).status == "succeeded"
+    assert registry.get(pull_job.id).status == "succeeded"
 
 
 async def test_a_failing_job_records_the_error_and_does_not_raise():

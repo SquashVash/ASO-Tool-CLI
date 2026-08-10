@@ -48,6 +48,20 @@ curl -s localhost:8081/health | jq
 journalctl -u aso-api -f
 ```
 
+### The nightly refresh unit
+
+`aso-refresh.service` POSTs to the API over loopback, so it has to know the
+port. It reads `ASO_API_PORT` from the same `/opt/aso/.env` the API does,
+defaulting to 8081 — change the port in `.env` and both follow. If you ever
+move `.env`, both units' `EnvironmentFile=` lines have to move with it, or the
+nightly refresh will quietly POST at the old port.
+
+`curl -f` means a non-2xx response marks the unit failed, which is intended:
+the two expected non-2xx are worth an email. A 409 means a refresh was already
+running when the timer fired (a manual one that overran, most likely) and
+nothing was started. A 422 means the filter matched no keywords. Neither is a
+crash; check `journalctl -u aso-refresh` before treating it as one.
+
 ## The optional browser extra
 
 Only `POST /popularity/pull` needs it, and it adds ~400MB plus apt

@@ -80,12 +80,25 @@ async def start_refresh(body: RefreshRequest, request: Request) -> JobResponse:
 
 
 @router.get("/jobs", response_model=list[JobResponse])
-def list_jobs(request: Request) -> list[JobResponse]:
+async def list_jobs(request: Request) -> list[JobResponse]:
+    """`async` where the data-reading handlers are `def`, deliberately.
+
+    Those read SQLite and belong in the threadpool. These two read the job
+    registry, which is plain mutable state owned by the event loop: `_trim`
+    pops from `_jobs` and `_run` writes `result` then `status` then
+    `finished_at`. From a worker thread, iterating `_jobs.values()` here races
+    that pop into `RuntimeError: dictionary changed size during iteration` (a
+    500), and `from_job` reads eleven fields non-atomically, so a poller can
+    see `status: "succeeded"` with `finished_at: null`. On the loop there is no
+    interleaving point, and nothing here blocks, so nothing is given up.
+    """
     return [JobResponse.from_job(job) for job in request.app.state.aso.jobs.list()]
 
 
 @router.get("/jobs/{job_id}", response_model=JobResponse)
-def get_job(job_id: str, request: Request) -> JobResponse:
+async def get_job(job_id: str, request: Request) -> JobResponse:
+    """`async` for the same reason as `list_jobs`: registry state is the
+    event loop's, and reading it from a worker thread tears."""
     job = request.app.state.aso.jobs.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"No job {job_id}")
