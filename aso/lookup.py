@@ -109,8 +109,8 @@ async def lookup_async(
         raise ValueError("country cannot be blank")
 
     async def run(active: Fetcher) -> tuple[pipeline.ScoredKeyword, int]:
-        # A supplied fetcher may have served other work already, so the cost of
-        # this lookup is the difference rather than its running total.
+        # A supplied fetcher is long-lived, so its counter is a running total
+        # for the process. `requests_made` on the result means this lookup.
         before = active.requests_made
         with session() as conn:
             itunes = ITunesClient(active, conn, settings)
