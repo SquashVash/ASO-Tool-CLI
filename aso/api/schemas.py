@@ -97,3 +97,26 @@ class SerpRow(BaseModel):
     @classmethod
     def from_row(cls, row) -> "SerpRow":
         return cls(**{key: row[key] for key in cls.model_fields})
+
+
+class MoverRow(BaseModel):
+    """A null delta means *not measured then*, never *did not move*."""
+
+    keyword_id: int
+    keyword: str
+    country: str
+    tags: list[str]
+    captured_at: str
+    baseline_at: str | None
+    opportunity_score: float | None
+    search_score: float | None
+    competition_score: float | None
+    opportunity_delta: float | None
+    search_delta: float | None
+    competition_delta: float | None
+
+    @classmethod
+    def from_row(cls, row) -> "MoverRow":
+        data = {key: row[key] for key in cls.model_fields if key != "tags"}
+        data["tags"] = split_tags(row["tags"])
+        return cls(**data)
