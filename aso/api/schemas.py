@@ -207,6 +207,24 @@ class JobResponse(BaseModel):
         return cls(**{key: getattr(job, key) for key in cls.model_fields})
 
 
+class ASAPullRequest(BaseModel):
+    days: int | None = None  # defaults to ASA_DEFAULT_LOOKBACK_DAYS
+
+
+class PopularityPullRequest(BaseModel):
+    country: str
+    tag: str | None = None
+    limit: int | None = None
+
+
+class RescoreResponse(BaseModel):
+    total: int
+    changed: int
+    largest_move: float
+    largest_move_keyword: str | None
+    backfilled_extensions: int
+
+
 class MoverRow(BaseModel):
     """A null delta means *not measured then*, never *did not move*."""
 
