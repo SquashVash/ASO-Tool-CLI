@@ -164,16 +164,16 @@ async def start_popularity_pull(
 
     async def run(job: Job) -> dict:
         job.total = len(terms)
-        try:
-            with session() as conn:
-                report = await pipeline.pull_apple_popularity(
-                    conn, terms, country=body.country, fetcher=state.fetcher
-                )
-        except ImportError as exc:
-            raise RuntimeError(
-                "The optional browser extra is not installed: "
-                "uv sync --extra browser && uv run playwright install chromium"
-            ) from exc
+        # No ImportError translation here: a missing `browser` extra never
+        # reaches this frame as one. `apple_transport.BrowserTransport`
+        # already catches it at the `playwright` import site and re-raises
+        # `ApplePopularityError` naming the install command, which propagates
+        # to `JobRegistry._run`'s generic handler and lands in `job.error`
+        # readable as-is.
+        with session() as conn:
+            report = await pipeline.pull_apple_popularity(
+                conn, terms, country=body.country, fetcher=state.fetcher
+            )
         job.done = job.total
         return {
             "requested": report.requested,
