@@ -16,3 +16,6 @@ exports/
 # Saved Apple Ads browser session. This is a credential — it holds live
 # session cookies for an account that can spend money.
 .apple-session/
+
+# Subagent-driven-development scratch: ledgers, briefs, review packages.
+.superpowers/

@@ -646,6 +646,9 @@ async def refresh(
             if on_progress is not None:
                 on_progress(outcome)
 
+    requests_before = fetcher.requests_made if fetcher is not None else 0
+    retries_before = fetcher.retries if fetcher is not None else 0
+
     if fetcher is not None:
         await run(fetcher)
         active_fetcher = fetcher
@@ -655,8 +658,11 @@ async def refresh(
             active_fetcher = owned
 
     report.finished_at = utcnow()
-    report.requests_made = active_fetcher.requests_made
-    report.retries = active_fetcher.retries
+    # A caller-supplied fetcher may be long-lived and shared — the API owns one
+    # for the whole process — so its counters accumulate across runs. Report
+    # what THIS run cost, not what the process has spent since boot.
+    report.requests_made = active_fetcher.requests_made - requests_before
+    report.retries = active_fetcher.retries - retries_before
     return report
 
 

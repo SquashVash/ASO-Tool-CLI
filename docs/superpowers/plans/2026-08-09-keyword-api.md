@@ -370,11 +370,13 @@ git commit -m "API: app skeleton, health, and aso serve"
 **Files:**
 - Create: `aso/api/schemas.py`
 - Create: `aso/api/routes/keywords.py`
+- Modify: `aso/repository.py` (add `get_keyword_by_id`)
 - Modify: `aso/api/app.py` (include the router)
 - Modify: `tests/conftest.py` (`SETTINGS_HOLDERS` if the new modules bind `settings`)
 - Test: `tests/test_api_keywords.py`
 
 **Interfaces:**
+- Produces: `repository.get_keyword_by_id(conn, keyword_id) -> sqlite3.Row | None`
 - Consumes: `repository.latest_scores`, `repository.list_keywords`, `repository.latest_snapshot`, `repository.snapshot_history`, `repository.latest_serp`, `repository.split_tags`, `config.COMPETITION_WEIGHTS`.
 - Produces:
   - `aso.api.schemas.KeywordScore`, `KeywordDetail`, `SnapshotRow`, `SerpRow`, `ComponentWeight`
@@ -509,7 +511,42 @@ def test_read_endpoints_never_touch_the_network(respx_mock, client):
 Run: `uv run pytest tests/test_api_keywords.py -v`
 Expected: FAIL — 404s on every `/keywords` path, since no router is registered.
 
-- [ ] **Step 3: Write the schemas**
+- [ ] **Step 3: Add `repository.get_keyword_by_id`**
+
+The API addresses keywords by id, and `repository` has no id lookup — only
+`get_keyword(conn, keyword, country)`. Add it beside `get_keyword` in
+`aso/repository.py`:
+
+```python
+def get_keyword_by_id(conn: sqlite3.Connection, keyword_id: int) -> sqlite3.Row | None:
+    """Resolve an id, for callers that address keywords by id rather than text.
+
+    The API does, because keywords contain spaces, unicode, and sometimes '/',
+    which no amount of URL encoding makes pleasant in a path segment.
+    """
+    return conn.execute(
+        "SELECT * FROM keywords WHERE id = ?", (keyword_id,)
+    ).fetchone()
+```
+
+Append its test to `tests/test_repository.py`:
+
+```python
+def test_get_keyword_by_id_round_trips(conn):
+    keyword_id, _ = repo.add_keyword(conn, "forex", "us", ["lcp"])
+    row = repo.get_keyword_by_id(conn, keyword_id)
+    assert row["keyword"] == "forex"
+    assert row["country"] == "us"
+
+
+def test_get_keyword_by_id_returns_none_when_absent(conn):
+    assert repo.get_keyword_by_id(conn, 9999) is None
+```
+
+Run: `uv run pytest tests/test_repository.py -k get_keyword_by_id -v`
+Expected: PASS (2 tests)
+
+- [ ] **Step 4: Write the schemas**
 
 Create `aso/api/schemas.py`:
 
@@ -615,7 +652,7 @@ class SerpRow(BaseModel):
         return cls(**{key: row[key] for key in cls.model_fields})
 ```
 
-- [ ] **Step 4: Write the keyword routes**
+- [ ] **Step 5: Write the keyword routes**
 
 Create `aso/api/routes/keywords.py`:
 
@@ -638,15 +675,11 @@ router = APIRouter(tags=["keywords"])
 
 
 def _require_keyword_row(conn: sqlite3.Connection, keyword_id: int) -> sqlite3.Row:
-    """Resolve an id to its keyword row, or 404.
-
-    Goes through `repository.list_keywords` rather than running its own SELECT:
-    all SQL stays in the repository, without exception.
-    """
-    for row in repository.list_keywords(conn, active_only=False):
-        if row["id"] == keyword_id:
-            return row
-    raise HTTPException(status_code=404, detail=f"No keyword with id {keyword_id}")
+    """Resolve an id to its keyword row, or 404."""
+    row = repository.get_keyword_by_id(conn, keyword_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No keyword with id {keyword_id}")
+    return row
 
 
 @router.get("/keywords", response_model=list[KeywordScore])
@@ -735,7 +768,7 @@ def keyword_serp(
     return [SerpRow.from_row(row) for row in repository.latest_serp(conn, keyword_id, limit=limit)]
 ```
 
-- [ ] **Step 5: Register the router**
+- [ ] **Step 6: Register the router**
 
 In `aso/api/app.py`, import `keywords` alongside `meta` and add:
 
@@ -743,19 +776,19 @@ In `aso/api/app.py`, import `keywords` alongside `meta` and add:
     app.include_router(keywords.router)
 ```
 
-- [ ] **Step 6: Update conftest**
+- [ ] **Step 7: Update conftest**
 
 Add `aso.api.routes.keywords` and `aso.api.schemas` to the conftest imports and `SETTINGS_HOLDERS` **only if** they bind `settings` at import. As written they do not — the enforcement test from Task 1 tells you the truth. Run it.
 
-- [ ] **Step 7: Run the tests**
+- [ ] **Step 8: Run the tests**
 
 Run: `uv run pytest tests/test_api_keywords.py tests/test_api_app.py -v`
 Expected: PASS (all)
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add aso/api tests/test_api_keywords.py tests/conftest.py
+git add aso/api aso/repository.py tests/test_api_keywords.py tests/test_repository.py tests/conftest.py
 git commit -m "API: keyword read endpoints"
 ```
 
@@ -1182,53 +1215,98 @@ This task changes existing code so a single long-lived `Fetcher` can be shared. 
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/test_pipeline.py`:
+Append to `tests/test_pipeline.py`. It already has `mock_both`, `track_keyword`, and `fast_fetcher` at module scope — use them, do not write new mocks:
 
 ```python
-async def test_refresh_reports_requests_for_this_run_not_the_process(conn, respx_mock):
-    """A shared, long-lived fetcher accumulates across runs.
-
-    Reporting its lifetime total would make the second refresh of the day claim
-    the first one's traffic.
+@respx.mock
+async def test_refresh_reports_requests_for_this_run_not_the_process(
+    conn: sqlite3.Connection,
+) -> None:
+    """A caller-supplied fetcher may be long-lived: the API owns one for its
+    whole process. Reporting the fetcher's lifetime total would make the second
+    refresh of the day claim the first one's traffic.
     """
-    from aso.config import settings as live_settings
+    mock_both()
+    row = track_keyword(conn)
 
-    repo.add_keyword(conn, "forex", "us")
-    rows = repo.list_keywords(conn)
+    async with fast_fetcher(retry_attempts=2) as fetcher:
+        first = await pipeline.refresh(conn, [row], fetcher=fetcher)
+        second = await pipeline.refresh(conn, [row], fetcher=fetcher)
+        total = fetcher.requests_made
 
-    async with http.Fetcher(live_settings) as fetcher:
-        fetcher.requests_made = 500
-        fetcher.retries = 7
-        report = await pipeline.refresh(conn, rows, fetcher=fetcher)
-
-    assert report.requests_made < 500
-    assert report.retries < 7
+    assert first.requests_made > 0
+    assert first.requests_made + second.requests_made == total
 ```
 
-Append to `tests/test_lookup.py`:
+Append to `tests/test_lookup.py`. That file stubs `pipeline.score_keyword` with
+`monkeypatch` rather than mocking HTTP — follow it; these two tests are about
+what `lookup_async` hands its clients, which needs no network at all:
 
 ```python
-async def test_lookup_async_reuses_a_caller_supplied_fetcher(respx_mock):
-    """The API owns one Fetcher for the process; lookup must not build its own,
-    or its requests would come out of a second token bucket on the same IP."""
-    from aso import http, lookup
-    from aso.config import settings as live_settings
+async def test_lookup_async_uses_a_caller_supplied_fetcher(monkeypatch) -> None:
+    """The API owns one Fetcher for its process. A lookup that built its own
+    would draw from a second token bucket against the same per-IP limit."""
+    from aso import db, pipeline
 
-    async with http.Fetcher(live_settings) as fetcher:
-        before = fetcher.requests_made
-        await lookup.lookup_async("forex", "us", fetcher=fetcher)
-        assert fetcher.requests_made > before
+    from .test_http import fast_fetcher
+
+    seen: dict[str, object] = {}
+
+    async def fake_score(keyword, country, *, itunes, hints, **kwargs):
+        seen["itunes_fetcher"] = itunes.fetcher
+        seen["hints_fetcher"] = hints.fetcher
+        seen["charts"] = kwargs.get("charts")
+        outcome = pipeline.KeywordOutcome(
+            keyword_id=0, keyword=keyword, country=country
+        )
+        return pipeline.ScoredKeyword(
+            outcome=outcome, comp_result=None, observation=None, serp=None
+        )
+
+    monkeypatch.setattr(lookup_module.pipeline, "score_keyword", fake_score)
+    with db.session() as conn:
+        db.migrate(conn)
+
+    async with fast_fetcher() as fetcher:
+        await lookup_module.lookup_async("forex", "us", fetcher=fetcher)
+
+    assert seen["itunes_fetcher"] is fetcher
+    assert seen["hints_fetcher"] is fetcher
 
 
-def test_sync_lookup_still_works_for_streamlit():
-    """dashboard.py has no event loop to borrow; the wrapper is why."""
-    from aso import lookup
+async def test_lookup_async_passes_the_chart_index_through(monkeypatch) -> None:
+    """Without it `comp_app_power` is None and `combine()` renormalizes over
+    the rest — and that component carries 0.625 of the fitted weight."""
+    from aso import db, pipeline
+    from aso.clients.charts import ChartIndex
 
-    result = lookup.lookup("forex", "us")
-    assert result.scored.outcome.keyword == "forex"
+    from .test_http import fast_fetcher
+
+    seen: dict[str, object] = {}
+
+    async def fake_score(keyword, country, *, itunes, hints, **kwargs):
+        seen["charts"] = kwargs.get("charts")
+        outcome = pipeline.KeywordOutcome(
+            keyword_id=0, keyword=keyword, country=country
+        )
+        return pipeline.ScoredKeyword(
+            outcome=outcome, comp_result=None, observation=None, serp=None
+        )
+
+    monkeypatch.setattr(lookup_module.pipeline, "score_keyword", fake_score)
+    with db.session() as conn:
+        db.migrate(conn)
+
+    index = ChartIndex(country="us", ranks={111: 3})
+    async with fast_fetcher() as fetcher:
+        await lookup_module.lookup_async("forex", "us", fetcher=fetcher, charts=index)
+
+    assert seen["charts"] is index
 ```
 
-Note: both lookup tests need the HTTP mocks the existing `tests/test_lookup.py` already sets up. Reuse whatever fixture the surrounding tests in that file use for iTunes and hints responses — read the top of the file first and follow it exactly rather than inventing new mocks.
+The sync `lookup()` wrapper needs no new test: every existing test in
+`tests/test_lookup.py` calls it, so they are the regression guard on the split.
+If they still pass, the wrapper still works.
 
 Create `tests/test_api_state.py`:
 
@@ -1464,16 +1542,21 @@ git commit -m "Share one Fetcher: async lookup core, per-day chart index, per-ru
 Create `tests/test_api_lookup.py`:
 
 ```python
-"""Live scoring of an arbitrary keyword."""
+"""Live scoring of an arbitrary keyword, end to end over HTTP."""
 
 from __future__ import annotations
 
 import pytest
+import respx
 from fastapi.testclient import TestClient
 
 from aso import db
 from aso.api.app import create_app
-from aso.clients.charts import ChartIndex
+
+from .test_pipeline import mock_both
+
+# The recorded fixtures `mock_both` serves are for this term.
+KEYWORD = "candlestick patterns"
 
 
 @pytest.fixture
@@ -1483,37 +1566,33 @@ def client():
         yield test_client
 
 
-@pytest.fixture(autouse=True)
-def stub_charts(monkeypatch):
-    """No test pays 48 chart requests."""
-    from aso.api import state as state_module
-
-    class Stub:
-        async def index(self, country, *, force=False):
-            return ChartIndex(country=country, ranks={111: 3})
-
-    monkeypatch.setattr(state_module, "ChartsClient", lambda *a, **kw: Stub())
-
-
-def test_lookup_scores_an_untracked_keyword(client, respx_mock):
-    """Set up iTunes and hints mocks exactly as tests/test_lookup.py does."""
-    body = client.post("/lookup", json={"keyword": "forex", "country": "us"}).json()
-    assert body["keyword"] == "forex"
+@respx.mock
+def test_lookup_scores_an_untracked_keyword(client):
+    mock_both()
+    body = client.post("/lookup", json={"keyword": KEYWORD, "country": "us"}).json()
+    assert body["keyword"] == KEYWORD
     assert body["tracked"] is False
     assert body["opportunity_score"] is not None
+    assert body["requests_made"] > 0
 
 
-def test_lookup_includes_comp_app_power(client, respx_mock):
-    """Without the chart index this is None and the competition score is not
-    comparable to a stored one — comp_app_power carries 0.625 of the weight."""
-    body = client.post("/lookup", json={"keyword": "forex", "country": "us"}).json()
+@respx.mock
+def test_lookup_includes_comp_app_power(client):
+    """The chart index is what makes this score comparable to a stored one.
+    Without it the component is None and `combine()` renormalizes over the
+    rest — and it carries 0.625 of the fitted weight."""
+    mock_both()
+    body = client.post("/lookup", json={"keyword": KEYWORD, "country": "us"}).json()
     assert body["components"]["comp_app_power"] is not None
 
 
-def test_a_repeat_lookup_is_free(client, respx_mock):
-    """The HTTP response cache is why: SERP and hints hold for 3 days."""
-    client.post("/lookup", json={"keyword": "forex", "country": "us"})
-    body = client.post("/lookup", json={"keyword": "forex", "country": "us"}).json()
+@respx.mock
+def test_a_repeat_lookup_is_free(client):
+    """SERP and autocomplete responses cache for 3 days and the chart index is
+    held in process state, so an identical second lookup must cost nothing."""
+    mock_both()
+    client.post("/lookup", json={"keyword": KEYWORD, "country": "us"})
+    body = client.post("/lookup", json={"keyword": KEYWORD, "country": "us"}).json()
     assert body["requests_made"] == 0
 
 
@@ -1521,6 +1600,12 @@ def test_lookup_rejects_a_blank_keyword(client):
     response = client.post("/lookup", json={"keyword": "  ", "country": "us"})
     assert response.status_code == 422
 ```
+
+`mock_both()` serves every chart feed as well as the SERP and hints, so the
+real `ChartsClient` runs against mocks — no stub needed, and `comp_app_power`
+comes out non-None exactly as it does in `test_pipeline.py`. Pacing is instant
+because `conftest`'s isolation fixture raises the rate limit for the whole
+suite, which is why `aso.api.app` must be in `SETTINGS_HOLDERS`.
 
 - [ ] **Step 2: Run it to verify it fails**
 
@@ -2615,8 +2700,10 @@ journalctl -u aso-api -f
 ## The optional browser extra
 
 Only `POST /popularity/pull` needs it, and it adds ~400MB plus apt
-dependencies. `/popularity/pull` returns 503 with an explanation until then, so
-this blocks nothing:
+dependencies. Until you opt in with `ASO_APPLE_POPULARITY_ENABLED=true`, that
+route returns 503 with an explanation, so this blocks nothing. With the flag on
+but the extra missing, the pull starts and the job fails with a message naming
+the install command:
 
 ```bash
 cd /opt/aso && sudo -u aso uv sync --extra browser
@@ -2714,6 +2801,15 @@ the snapshots in `aso.db`, plus journald. The registry keeps the last 50.
 One job per kind: a second `POST /refresh` while one is running gets 409, since
 two runs writing snapshots for an overlapping set is simply wrong. A refresh
 and an ASA pull together are fine.
+
+`POST /jobs/{id}/cancel` returns the job already marked `cancelled`, with its
+partial `done` count intact — the route yields to the event loop once so the
+cancelled task can stamp its own terminal status before the response is built.
+Snapshots the run already committed stay committed.
+
+`POST /refresh` rejects `limit` below 1. Zero would select nothing and then
+report "no keywords match that filter", which is false — keywords matched, the
+limit discarded them.
 
 **Run one worker.** `aso serve` has no `--workers` flag on purpose: two workers
 would mean two token buckets and two job registries behind one URL.

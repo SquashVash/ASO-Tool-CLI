@@ -1,0 +1,22 @@
+[Unit]
+Description=Nightly aso refresh, via the API
+Requires=aso-api.service
+After=aso-api.service
+
+[Service]
+Type=oneshot
+User=aso
+# The port must match what the API actually bound. `Environment=` first
+# supplies the same default as `config.api_port`; the EnvironmentFile after it
+# wins when `.env` sets `ASO_API_PORT`, which is what makes changing the port
+# in one place enough. Without the file, changing it there would leave this
+# unit POSTing into a closed port every night and the failure would look like
+# a refresh bug.
+Environment=ASO_API_PORT=8081
+EnvironmentFile=/opt/aso/.env
+# Deliberately NOT `aso refresh`. The CLI would open a second token bucket
+# against the same per-IP rate limit as the running API and earn a 403. The
+# API process is the only thing that talks to Apple.
+ExecStart=/usr/bin/curl -fsS --max-time 30 -X POST \
+    -H 'Content-Type: application/json' -d '{}' \
+    http://127.0.0.1:${ASO_API_PORT}/refresh

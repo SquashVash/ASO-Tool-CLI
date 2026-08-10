@@ -1,8 +1,11 @@
 """Ad-hoc keyword lookup: score a keyword without tracking it.
 
-The same thing `aso check` does, packaged for a caller that cannot use asyncio
-directly — which in practice means Streamlit, whose script model reruns the
-whole module on every widget interaction and offers no event loop of its own.
+The same thing `aso check` does, packaged for two callers. `lookup_async` is
+the core; the API awaits it directly, so it can hand over the one `Fetcher` its
+process owns. `lookup` wraps it in `asyncio.run` for a caller that cannot use
+asyncio directly — which in practice means Streamlit, whose script model reruns
+the whole module on every widget interaction and offers no event loop of its
+own.
 
 **Why this is a module and not four lines inside `dashboard.py`.** The
 dashboard was built strictly read-only, and one of the two reasons was that a
@@ -21,6 +24,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from . import pipeline, repository
+from .clients.charts import ChartIndex
 from .clients.hints import HintsClient
 from .clients.itunes import ITunesClient
 from .config import settings
@@ -73,15 +77,29 @@ def opportunity_percentile(
     return 100.0 * beaten / len(values), len(values)
 
 
-def lookup(keyword: str, country: str, *, force: bool = False) -> LookupResult:
+async def lookup_async(
+    keyword: str,
+    country: str,
+    *,
+    force: bool = False,
+    fetcher: Fetcher | None = None,
+    charts: ChartIndex | None = None,
+) -> LookupResult:
     """Score `keyword` live. Writes no keyword, no snapshot, no SERP.
 
     The HTTP response cache *is* written, because that is a cache rather than a
     record — it makes repeating a lookup free, which matters when the caller is
     a UI someone will click twice.
 
-    Runs its own event loop via `asyncio.run`, so it must not be called from
-    inside one. That is the whole point: Streamlit has no loop to borrow.
+    `fetcher` lets a long-lived caller — the API — supply the one `Fetcher` its
+    process owns, so an ad-hoc lookup draws on the same token bucket a refresh
+    is using rather than opening a second one against the same IP.
+
+    `charts` is what makes the resulting competition score comparable to a
+    stored one. Without it `comp_app_power` is None and `combine()`
+    renormalizes over the rest — and that component carries 0.625 of the fitted
+    weight, more than every other combined. `aso check` declines to pay 48
+    requests for a one-off; a server that holds the index all day should not.
     """
     keyword = keyword.strip()
     country = country.strip().lower()
@@ -90,22 +108,33 @@ def lookup(keyword: str, country: str, *, force: bool = False) -> LookupResult:
     if not country:
         raise ValueError("country cannot be blank")
 
-    async def run() -> tuple[pipeline.ScoredKeyword, int]:
-        async with Fetcher(settings) as fetcher:
-            with session() as conn:
-                itunes = ITunesClient(fetcher, conn, settings)
-                hints = HintsClient(fetcher, conn, settings)
-                scored = await pipeline.score_keyword(
-                    keyword, country, itunes=itunes, hints=hints, force=force
-                )
-                # An ad-hoc check must report the same demand number a tracked
-                # keyword would. `score_keyword` cannot do this itself — it is
-                # deliberately table-free — so the blend happens here, where
-                # there is a connection.
-                pipeline.blend_outcome(conn, scored.outcome)
-            return scored, fetcher.requests_made
+    async def run(active: Fetcher) -> tuple[pipeline.ScoredKeyword, int]:
+        # A supplied fetcher is long-lived, so its counter is a running total
+        # for the process. `requests_made` on the result means this lookup.
+        before = active.requests_made
+        with session() as conn:
+            itunes = ITunesClient(active, conn, settings)
+            hints = HintsClient(active, conn, settings)
+            scored = await pipeline.score_keyword(
+                keyword,
+                country,
+                itunes=itunes,
+                hints=hints,
+                force=force,
+                charts=charts,
+            )
+            # An ad-hoc check must report the same demand number a tracked
+            # keyword would. `score_keyword` cannot do this itself — it is
+            # deliberately table-free — so the blend happens here, where
+            # there is a connection.
+            pipeline.blend_outcome(conn, scored.outcome)
+        return scored, active.requests_made - before
 
-    scored, requests_made = asyncio.run(run())
+    if fetcher is not None:
+        scored, requests_made = await run(fetcher)
+    else:
+        async with Fetcher(settings) as owned:
+            scored, requests_made = await run(owned)
 
     with session() as conn:
         existing = repository.get_keyword(conn, keyword, country)
@@ -120,3 +149,13 @@ def lookup(keyword: str, country: str, *, force: bool = False) -> LookupResult:
         percentile=percentile,
         compared_against=compared,
     )
+
+
+def lookup(keyword: str, country: str, *, force: bool = False) -> LookupResult:
+    """Synchronous `lookup_async`, for a caller with no event loop to borrow.
+
+    That caller is Streamlit, whose script model reruns the whole module on
+    every widget interaction and offers no loop of its own. Runs its own loop
+    via `asyncio.run`, so it must not be called from inside one.
+    """
+    return asyncio.run(lookup_async(keyword, country, force=force))

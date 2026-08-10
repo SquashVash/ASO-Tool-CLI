@@ -599,15 +599,28 @@ def parse_ts(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
+def connect(
+    db_path: Path | str | None = None, *, check_same_thread: bool = True
+) -> sqlite3.Connection:
     """Open a connection with the pragmas this tool assumes everywhere.
 
     WAL + a generous busy timeout matter because a refresh run and the
     Streamlit dashboard routinely have the database open at the same time.
+
+    `check_same_thread` defaults to True and should stay that way for the CLI,
+    the dashboard, and the job bodies: each of those uses one connection on one
+    thread, and the check catches a real bug for free. The only caller that
+    turns it off is `api.deps.get_conn`, where a request's own connection is
+    handed between threadpool workers sequentially — see the docstring there.
     """
     path = Path(db_path) if db_path is not None else settings.db_path
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=30.0, isolation_level=None)
+    conn = sqlite3.connect(
+        path,
+        timeout=30.0,
+        isolation_level=None,
+        check_same_thread=check_same_thread,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
@@ -616,9 +629,11 @@ def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
 
 
 @contextmanager
-def session(db_path: Path | str | None = None) -> Iterator[sqlite3.Connection]:
+def session(
+    db_path: Path | str | None = None, *, check_same_thread: bool = True
+) -> Iterator[sqlite3.Connection]:
     """Connection context manager that always closes."""
-    conn = connect(db_path)
+    conn = connect(db_path, check_same_thread=check_same_thread)
     try:
         yield conn
     finally:

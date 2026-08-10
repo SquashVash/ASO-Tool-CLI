@@ -118,6 +118,17 @@ def get_keyword(
     ).fetchone()
 
 
+def get_keyword_by_id(conn: sqlite3.Connection, keyword_id: int) -> sqlite3.Row | None:
+    """Resolve an id, for callers that address keywords by id rather than text.
+
+    The API does, because keywords contain spaces, unicode, and sometimes '/',
+    which no amount of URL encoding makes pleasant in a path segment.
+    """
+    return conn.execute(
+        "SELECT * FROM keywords WHERE id = ?", (keyword_id,)
+    ).fetchone()
+
+
 def require_keyword(
     conn: sqlite3.Connection, keyword: str, country: str
 ) -> sqlite3.Row:
@@ -154,6 +165,20 @@ def list_keywords(
 def set_active(conn: sqlite3.Connection, keyword_id: int, active: bool) -> None:
     conn.execute(
         "UPDATE keywords SET active = ? WHERE id = ?", (1 if active else 0, keyword_id)
+    )
+
+
+def set_tags(
+    conn: sqlite3.Connection, keyword_id: int, tags: Iterable[str] | str | None
+) -> None:
+    """Replace a keyword's tag set.
+
+    `add_keyword` merges, because re-importing an overlapping CSV must be safe.
+    Replacing is the other half: without it there is no way to remove a tag.
+    """
+    conn.execute(
+        "UPDATE keywords SET tags = ? WHERE id = ?",
+        (normalize_tags(tags), keyword_id),
     )
 
 

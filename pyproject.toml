@@ -13,6 +13,8 @@ dependencies = [
     "streamlit>=1.38",
     "python-dotenv>=1.0",
     "pyjwt[crypto]>=2.9",
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.52.1",
 ]
 
 [project.optional-dependencies]

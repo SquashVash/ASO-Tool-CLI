@@ -1,0 +1,25 @@
+[Unit]
+Description=aso keyword API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aso
+Group=aso
+WorkingDirectory=/opt/aso
+EnvironmentFile=/opt/aso/.env
+ExecStart=/usr/local/bin/uv run aso serve
+Restart=always
+RestartSec=5
+
+# The API binds loopback and there is no authentication, so the process should
+# be able to reach as little of the host as possible.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/aso
+
+[Install]
+WantedBy=multi-user.target

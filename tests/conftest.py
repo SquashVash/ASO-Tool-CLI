@@ -8,6 +8,10 @@ from pathlib import Path
 import pytest
 
 from aso import cache, cli, config, db, http, lookup, pipeline, repository  # noqa: F401
+from aso.api import app as api_app  # noqa: F401
+from aso.api import state as api_state  # noqa: F401
+from aso.api.routes import jobs as routes_jobs  # noqa: F401
+from aso.api.routes import meta as routes_meta  # noqa: F401
 from aso.clients import hints, itunes
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -19,7 +23,10 @@ FIXTURES = Path(__file__).parent / "fixtures"
 # `lookup` is on this list because it builds its own Fetcher: omitting it made
 # a lookup test pace itself at the production 15 req/min against the real
 # aso.db, which is exactly the failure this tuple exists to prevent.
-SETTINGS_HOLDERS = (config, db, cli, http, lookup, pipeline, itunes, hints)
+SETTINGS_HOLDERS = (
+    config, db, cli, http, lookup, pipeline, itunes, hints,
+    api_app, api_state, routes_meta, routes_jobs,
+)
 
 
 @pytest.fixture(autouse=True)

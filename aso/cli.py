@@ -143,6 +143,31 @@ def version() -> None:
 
 
 @app.command()
+def serve(
+    host: str = typer.Option(settings.api_host, "--host"),
+    port: int = typer.Option(settings.api_port, "--port"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Run the HTTP API.
+
+    Deliberately no --workers flag. Two workers would mean two token buckets
+    against a per-IP rate limit, and two job registries behind one URL.
+    """
+    import uvicorn
+
+    setup_logging(verbose)
+    console.print(f"[green]aso api[/green] http://{host}:{port}")
+    uvicorn.run(
+        "aso.api.app:create_app",
+        factory=True,
+        host=host,
+        port=port,
+        workers=1,
+        log_level="info" if verbose else "warning",
+    )
+
+
+@app.command()
 def add(
     keyword: str = typer.Argument(..., help="The keyword or phrase to track."),
     country: str = typer.Option(settings.default_country, "--country", "-c"),

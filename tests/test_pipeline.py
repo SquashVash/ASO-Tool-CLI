@@ -717,3 +717,23 @@ async def test_calibration_still_drops_a_failed_fetch(
     )
 
     assert pipeline.calibration_from_db(conn, "appfigures") == []
+
+
+@respx.mock
+async def test_refresh_reports_requests_for_this_run_not_the_process(
+    conn: sqlite3.Connection,
+) -> None:
+    """A caller-supplied fetcher may be long-lived: the API owns one for its
+    whole process. Reporting the fetcher's lifetime total would make the second
+    refresh of the day claim the first one's traffic.
+    """
+    mock_both()
+    row = track_keyword(conn)
+
+    async with fast_fetcher(retry_attempts=2) as fetcher:
+        first = await pipeline.refresh(conn, [row], fetcher=fetcher)
+        second = await pipeline.refresh(conn, [row], fetcher=fetcher)
+        total = fetcher.requests_made
+
+    assert first.requests_made > 0
+    assert first.requests_made + second.requests_made == total
