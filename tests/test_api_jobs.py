@@ -39,11 +39,12 @@ async def test_a_second_job_of_the_same_kind_is_refused():
         await gate.wait()
         return {}
 
-    await registry.start("refresh", blocking)
+    job = await registry.start("refresh", blocking)
     with pytest.raises(JobConflict):
         await registry.start("refresh", blocking)
 
     gate.set()
+    await registry.wait(job.id)
 
 
 async def test_different_kinds_may_run_concurrently():
@@ -56,9 +57,11 @@ async def test_different_kinds_may_run_concurrently():
         await gate.wait()
         return {}
 
-    await registry.start("refresh", blocking)
-    await registry.start("asa_pull", blocking)
+    refresh_job = await registry.start("refresh", blocking)
+    pull_job = await registry.start("asa_pull", blocking)
     gate.set()
+    await registry.wait(refresh_job.id)
+    await registry.wait(pull_job.id)
 
 
 async def test_a_failing_job_records_the_error_and_does_not_raise():
@@ -98,6 +101,8 @@ async def test_cancelling_an_unknown_job_returns_false():
 
 
 async def test_history_is_bounded_but_never_evicts_a_running_job():
+    """The bound must evict the oldest finished jobs, not the newest — a
+    caller polling GET /jobs for the run it just finished must still find it."""
     registry = JobRegistry(history=3)
     gate = asyncio.Event()
 
@@ -106,13 +111,21 @@ async def test_history_is_bounded_but_never_evicts_a_running_job():
         return {}
 
     long_running = await registry.start("refresh", blocking)
+    finished_jobs = []
     for _ in range(5):
         finished = await registry.start("rescore", lambda job: _done())
         await registry.wait(finished.id)
+        finished_jobs.append(finished)
 
     assert registry.get(long_running.id) is not None
-    assert len(registry.list()) <= 4  # 3 finished + the running one
+    assert len(registry.list()) == 4  # 3 finished + the running one
+    # The 3 kept must be the most recent, not the first 3 to have run.
+    kept_ids = {job.id for job in registry.list()}
+    assert kept_ids == {long_running.id} | {job.id for job in finished_jobs[-3:]}
+    assert finished_jobs[-1].id in kept_ids
+
     gate.set()
+    await registry.wait(long_running.id)
 
 
 async def _done():

@@ -42,6 +42,11 @@ class Job:
     current: str | None = None
     result: dict | None = None
     error: str | None = None
+    # `started_at` is second-precision, so jobs started in the same second
+    # are indistinguishable by timestamp. `list()` still needs a strict
+    # newest-first order for callers polling `GET /jobs` right after a run
+    # finishes, so ordering is by this monotonic counter, not the clock.
+    seq: int = 0
 
 
 class JobConflict(RuntimeError):
@@ -58,6 +63,7 @@ class JobRegistry:
         self._history = history
         self._jobs: dict[str, Job] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        self._next_seq = 0
 
     def running(self, kind: str) -> Job | None:
         for job in self._jobs.values():
@@ -68,7 +74,14 @@ class JobRegistry:
     async def start(self, kind: str, run: JobBody, *, params: dict | None = None) -> Job:
         if self.running(kind) is not None:
             raise JobConflict(kind)
-        job = Job(id=uuid4().hex, kind=kind, started_at=utcnow(), params=params or {})
+        job = Job(
+            id=uuid4().hex,
+            kind=kind,
+            started_at=utcnow(),
+            params=params or {},
+            seq=self._next_seq,
+        )
+        self._next_seq += 1
         self._jobs[job.id] = job
         self._tasks[job.id] = asyncio.create_task(self._run(job, run))
         # Give the task a real turn before returning. A task cancelled before
@@ -84,7 +97,7 @@ class JobRegistry:
         return self._jobs.get(job_id)
 
     def list(self) -> list[Job]:
-        return sorted(self._jobs.values(), key=lambda job: job.started_at, reverse=True)
+        return sorted(self._jobs.values(), key=lambda job: job.seq, reverse=True)
 
     async def cancel(self, job_id: str) -> bool:
         task = self._tasks.get(job_id)
@@ -125,6 +138,12 @@ class JobRegistry:
             self._trim()
 
     def _trim(self) -> None:
-        finished = [job for job in self.list() if job.status != RUNNING]
-        for job in finished[self._history :]:
-            self._jobs.pop(job.id, None)
+        # `self._jobs` is insertion-ordered by start(), so this is
+        # oldest-first — evicting the tail keeps the *most recent* finished
+        # jobs. Routing this through `list()` (newest-first) would evict the
+        # jobs a caller polling `GET /jobs` just finished waiting for.
+        finished = [job for job in self._jobs.values() if job.status != RUNNING]
+        excess = len(finished) - self._history
+        if excess > 0:
+            for job in finished[:excess]:
+                self._jobs.pop(job.id, None)
