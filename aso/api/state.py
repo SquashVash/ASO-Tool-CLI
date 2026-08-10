@@ -6,6 +6,7 @@ Held on `app.state.aso` and reachable from any handler via `request.app.state`.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -13,6 +14,8 @@ from datetime import datetime, timezone
 from ..clients.charts import ChartIndex, ChartsClient
 from ..config import settings
 from ..http import Fetcher
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -40,5 +43,14 @@ class AppState:
                 return cached
             client = ChartsClient(self.fetcher, conn, settings)
             index = await client.index(country)
+            if not index:
+                # Every feed failed. `ChartsClient.index` never raises, so the
+                # caller still gets an answer — with `comp_app_power` absent,
+                # which is honest. Caching it would not be: 0.625 of the fitted
+                # competition weight would go missing from every lookup until
+                # UTC midnight because of one bad minute. Retry on the next
+                # request instead.
+                logger.warning("chart index for %s loaded no feeds; not cached", country)
+                return index
             self.chart_indexes[key] = index
             return index
