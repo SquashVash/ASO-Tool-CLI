@@ -678,3 +678,54 @@ def test_check_says_it_did_not_track(isolated_db: Path) -> None:
     result = invoke("check", "forex")
     assert "Not tracked" in result.output
     assert "aso add" in result.output
+
+
+# --- suggest ---------------------------------------------------------------
+
+
+@respx.mock
+def test_suggest_lists_candidates(isolated_db: Path) -> None:
+    mock_apple()
+    result = invoke("suggest", "candle")
+    assert result.exit_code == 0
+    assert "prefix" in result.output
+    assert "candlestick" in result.output
+
+
+@respx.mock
+def test_suggest_json_carries_provenance(isolated_db: Path) -> None:
+    """Every candidate says which prefix surfaced it and where it ranked."""
+    mock_apple()
+    payload = json.loads(invoke("suggest", "candle", "--json").stdout)
+    assert payload["keyword"] == "candle"
+    assert payload["prefixes_probed"] == ["candle", "candl", "cand", "can", "ca", "c"]
+    first = payload["candidates"][0]
+    assert set(first) == {"term", "prefix", "rank", "surfaced_by", "tracked"}
+
+
+@respx.mock
+def test_suggest_hides_tracked_terms_by_default(isolated_db: Path) -> None:
+    mock_apple()
+    term = json.loads(invoke("suggest", "candle", "--json").stdout)["candidates"][0]["term"]
+    invoke("add", term)
+
+    payload = json.loads(invoke("suggest", "candle", "--json").stdout)
+    assert term not in [c["term"] for c in payload["candidates"]]
+
+    payload = json.loads(invoke("suggest", "candle", "--json", "--include-tracked").stdout)
+    assert term in [c["term"] for c in payload["candidates"]]
+
+
+@respx.mock
+def test_suggest_writes_nothing(isolated_db: Path) -> None:
+    """Discovery is read-only: seeing a term is not deciding to track it."""
+    mock_apple()
+    invoke("suggest", "candle")
+    with store_module.session() as store:
+        assert store.records == []
+
+
+def test_suggest_rejects_a_blank_keyword(isolated_db: Path) -> None:
+    result = invoke("suggest", "   ")
+    assert result.exit_code == 1
+    assert "blank" in result.output.lower()

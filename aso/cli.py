@@ -1,5 +1,6 @@
 """Typer entrypoint.
 
+    aso suggest "habit"                   # what should I even track?
     aso check "meditation timer"          # score it without tracking it
     aso add "candlestick patterns" --country us --tag lcp
     aso import keywords.csv
@@ -29,9 +30,10 @@ from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
 from . import __version__, calibration, importers, pipeline
+from . import suggest as suggest_module
 from .clients import apple_popularity, asa
 from .clients.charts import ChartsClient
-from .clients.hints import HintsClient
+from .clients.hints import HintsClient, UnknownStorefront
 from .clients.itunes import ITunesClient
 from .config import (
     ASA_DEFAULT_LOOKBACK_DAYS,
@@ -449,6 +451,112 @@ def check(
     console.print(
         f"[dim]{requests} request(s). Not tracked — nothing written. "
         f"`aso add {keyword!r} --country {country.lower()}` to keep it.[/dim]"
+    )
+
+
+@app.command()
+def suggest(
+    keyword: str = typer.Argument(..., help="Seed term to walk the ladder from."),
+    country: str = typer.Option(settings.default_country, "--country", "-c"),
+    force: bool = typer.Option(False, "--force", help="Ignore cached responses."),
+    include_tracked: bool = typer.Option(
+        False, "--include-tracked", help="Also show terms you already track."
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit the candidates as JSON."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Log every request."),
+) -> None:
+    """Keyword discovery: what Apple suggests to someone typing toward this term.
+
+    Walks every rung of the prefix ladder — "candle", "candl", "cand", ... —
+    and returns everything Apple offered along the way. Deliberately NOT the
+    scorer's walk, which stops as soon as the term itself stops appearing; the
+    keywords worth finding are the ones that never appear at all.
+
+    Costs one request per rung, at most 12, at the paced rate: roughly 20s for
+    a short keyword and 48s for a long one, and nothing on a repeat inside the
+    3-day cache. It builds no chart index, so it is far cheaper than `check`.
+
+    Writes nothing. Nothing here is scored either — `aso check` prices the
+    candidates worth pricing, one at a time.
+    """
+    setup_logging(verbose)
+    try:
+        result = suggest_module.suggest(
+            keyword,
+            country,
+            force=force,
+            include_tracked=include_tracked,
+        )
+    except (ValueError, UnknownStorefront) as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    if as_json:
+        console.print_json(
+            data={
+                "keyword": result.keyword,
+                "country": result.country,
+                "prefixes_probed": result.prefixes_probed,
+                "requests_made": result.requests_made,
+                "failed": result.failed,
+                "error": result.error,
+                "candidates": [
+                    {
+                        "term": c.term,
+                        "prefix": c.prefix,
+                        "rank": c.rank,
+                        "surfaced_by": c.surfaced_by,
+                        "tracked": c.tracked,
+                    }
+                    for c in result.candidates
+                ],
+            }
+        )
+        return
+
+    if not result.candidates:
+        console.print(
+            f"[yellow]Apple suggested nothing new for {result.keyword!r} "
+            f"({result.country}).[/yellow]"
+        )
+    else:
+        table = Table(
+            title=f"{len(result.candidates)} candidate(s) from {result.keyword!r} "
+            f"({result.country})",
+            header_style="bold",
+        )
+        table.add_column("term")
+        table.add_column("prefix")
+        table.add_column("rank", justify="right")
+        table.add_column("seen", justify="right")
+        if include_tracked:
+            table.add_column("tracked")
+        for candidate in result.candidates:
+            row = [
+                candidate.term,
+                f"[dim]{candidate.prefix}[/dim]",
+                str(candidate.rank),
+                str(candidate.surfaced_by),
+            ]
+            if include_tracked:
+                row.append("[green]yes[/green]" if candidate.tracked else "[dim]—[/dim]")
+            table.add_row(*row)
+        console.print(table)
+        console.print(
+            "[dim]Sorted by the deepest prefix that still surfaced the term, "
+            "then Apple's own order within it. A term offered after five "
+            "characters is about your seed; one that died at the first letter "
+            "is a popular app sharing a letter. Rank compares within one "
+            "prefix only.[/dim]"
+        )
+
+    if result.failed:
+        err_console.print(f"[yellow]Ladder stopped early:[/yellow] {result.error}")
+
+    console.print(
+        f"[dim]{result.requests_made} request(s), "
+        f"{len(result.prefixes_probed)} prefix(es). Nothing tracked — "
+        f"`aso check \"<term>\"` to price one.[/dim]"
     )
 
 

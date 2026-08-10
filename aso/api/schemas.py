@@ -213,3 +213,51 @@ class RescoreResponse(BaseModel):
     changed: int
     largest_move: float
     largest_move_keyword: str | None
+
+
+class CandidateRow(BaseModel):
+    term: str
+    # The SHORTEST prefix that surfaced this term, and its rank in that list.
+    # Apple orders by demand within one list; across two different prefixes
+    # rank is NOT comparable, which is why results sort on prefix length first.
+    prefix: str
+    rank: int
+    surfaced_by: int
+    tracked: bool
+
+    @classmethod
+    def from_candidate(cls, candidate) -> "CandidateRow":
+        return cls(**{key: getattr(candidate, key) for key in cls.model_fields})
+
+
+class SuggestRequest(BaseModel):
+    keyword: str
+    country: str
+    force: bool = False
+    # Discovery answers "what am I missing", so tracked terms are noise by
+    # default. The cost: a tracked keyword that has DROPPED OUT of Apple's
+    # suggestions is then indistinguishable from one that never appeared.
+    include_tracked: bool = False
+
+
+class SuggestResponse(BaseModel):
+    keyword: str
+    country: str
+    candidates: list[CandidateRow]
+    prefixes_probed: list[str]
+    requests_made: int
+    # A failure part-way down the ladder keeps whatever was collected.
+    failed: bool
+    error: str | None
+
+    @classmethod
+    def from_result(cls, result) -> "SuggestResponse":
+        return cls(
+            keyword=result.keyword,
+            country=result.country,
+            candidates=[CandidateRow.from_candidate(c) for c in result.candidates],
+            prefixes_probed=result.prefixes_probed,
+            requests_made=result.requests_made,
+            failed=result.failed,
+            error=result.error,
+        )

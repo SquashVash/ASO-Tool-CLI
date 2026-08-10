@@ -14,7 +14,7 @@ from fastapi import FastAPI
 
 from ..config import settings
 from ..http import Fetcher
-from .routes import jobs, keywords, lookup, meta
+from .routes import jobs, keywords, lookup, meta, suggest
 from .state import AppState
 
 logger = logging.getLogger(__name__)
@@ -42,5 +42,6 @@ def create_app() -> FastAPI:
     app.include_router(meta.router)
     app.include_router(keywords.router)
     app.include_router(lookup.router)
+    app.include_router(suggest.router)
     app.include_router(jobs.router)
     return app

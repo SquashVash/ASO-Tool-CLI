@@ -9,8 +9,8 @@ State lives in a handful of small JSON files under `data/` — the tracked
 keyword list, the measured observations the fits train on, and the fitted
 bridges. There is no database.
 
-> **Build status:** complete. CLI, HTTP API, scoring, Apple Search Ads and
-> calibration are all in, with 539 tests.
+> **Build status:** complete. CLI, HTTP API, keyword discovery, scoring, Apple
+> Search Ads and calibration are all in, with 572 tests.
 >
 > **No trend history.** Each keyword carries its latest scores, not a series
 > of them. `refresh` overwrites. What went with the history: the SERP
@@ -764,6 +764,7 @@ TTL. Raise `ASO_RATE_LIMIT_PER_MIN` at your own risk.
 ## CLI
 
 ```
+aso suggest "habit"                     # what should I even track?
 aso check "meditation timer"            # score once, track nothing
 aso add "candlestick patterns" --country us --tag lcp
 aso import keywords.csv                 # needs a `keyword` column
@@ -848,6 +849,7 @@ interleave request-by-request instead of queueing behind a lock.
 | `PATCH /keywords/{id}` | `active`, `tags` (replaces) |
 | `DELETE /keywords/{id}` | permanent; returns what it removed |
 | `POST /lookup` | score any keyword live |
+| `POST /suggest` | keyword discovery from Apple's completions |
 | `POST /refresh` | 202 + job id |
 | `POST /asa/pull`, `POST /popularity/pull` | 202 + job id |
 | `POST /rescore` | synchronous |
@@ -860,6 +862,47 @@ the string finds the id.
 Every response carrying a score also carries `captured_at`. A machine that
 cannot tell a fresh score from a three-week-old one will treat stale data as
 current.
+
+### `/suggest` finds keywords; `/lookup` prices them
+
+`POST /suggest {"keyword": "habit", "country": "us"}` walks every rung of the
+prefix ladder — `habit`, `habi`, `hab`, `ha`, `h` — and returns everything Apple
+offered along the way, as keyword candidates.
+
+It is **not** the scorer's walk. `search.observe` stops at the first miss, which
+is right for scoring and backwards for discovery: the keywords worth finding are
+the ones Apple never echoes back, and their ladder stops after one probe.
+Discovery shares `prefix_lengths()` and probes every rung.
+
+Each candidate carries the **deepest prefix that still surfaced it**, its rank in
+that list, and how many rungs mentioned it:
+
+```
+term                     prefix   rank   seen
+habit tracker            habit       1      3
+habitica                 habit       3      3
+habitkit                 habit       6      3
+habbit                   hab         8      1
+hay day                  ha          3      1
+```
+
+**Why deepest and not shortest.** A shorter prefix is the stronger *demand*
+signal — that is exactly what `SEARCH_DEPTH_WEIGHT` encodes for scoring. On a
+prefix ladder it is also the weaker *relevance* signal, because the shallow
+rungs return whatever is most popular in the whole storefront. Sorted
+shortest-first, `aso suggest habit` leads with `hinge`, `hbo max` and
+`home depot`. Deepest-first leads with habit trackers. Rank breaks ties within
+one prefix; across two prefixes ranks are not comparable.
+
+Terms you already track are excluded by default. The cost is that a keyword
+which has *dropped out* of Apple's suggestions then looks the same as one that
+never appeared — pass `include_tracked` to see them, flagged.
+
+**Nothing is scored, and nothing is written.** Pricing forty candidates is forty
+SERP fetches plus forty ladders. `suggest` gives you names; `check` and
+`/lookup` price the ones worth pricing. It also builds no chart index, so it
+costs `min(len(keyword), 12)` requests — about 20s for a short seed, 48s for a
+long one, and nothing on a repeat inside the 3-day hints TTL.
 
 ### `/lookup` is cached, and pays for the chart index
 

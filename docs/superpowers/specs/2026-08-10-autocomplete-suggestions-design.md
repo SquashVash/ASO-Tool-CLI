@@ -64,7 +64,7 @@ already share through `lookup.py`.
 @dataclass(frozen=True)
 class Candidate:
     term: str
-    prefix: str        # the SHORTEST prefix that surfaced this term
+    prefix: str        # the DEEPEST prefix that still surfaced this term
     rank: int          # its 1-based position in that prefix's list
     surfaced_by: int   # how many rungs mentioned it at all
     tracked: bool
@@ -82,24 +82,38 @@ class SuggestResult:
 
 ### Ordering
 
-Default sort: **shortest prefix first, then rank ascending.**
+Default sort: **deepest prefix first, then rank ascending.**
 
-This is not an invented ranking. It restates what `SEARCH_DEPTH_WEIGHT` (0.30,
-fitted) already claims: a term Apple offers after three characters carries more
-demand than one that needs eleven. Within a single list Apple's order *is* the
-demand signal; across two different prefixes raw rank is not comparable, which
-is why depth leads and rank only breaks ties.
+> **Corrected after first run.** This section originally specified the
+> *shortest* prefix, reasoning that it restates what `SEARCH_DEPTH_WEIGHT`
+> (0.30, fitted) claims: a term offered after three characters carries more
+> demand than one needing eleven. That reasoning is sound and it answers the
+> wrong question.
+>
+> Running `aso suggest habit` under the original rule returned, in order:
+> `hinge`, `hbo max`, `hoopla`, `hulu`, `home depot`. All surfaced at prefix
+> `"h"`, all genuinely high-demand, none remotely about habits — while
+> `habit tracker`, `habitica` and `habitify` sat at the bottom.
+>
+> On a prefix ladder, demand and relevance are in direct opposition. The
+> shallow rungs return whatever is most popular in the entire storefront,
+> because that is what Apple completes a single letter with. Discovery needs
+> relevance, so depth is inverted here relative to scoring.
 
-Both fields ship on every candidate so a caller can re-sort. The API documents
-that cross-prefix rank comparison is not a demand ordering.
+A term still being offered once you have typed five characters is about your
+seed; one that died at `"h"` shares a letter with it. Within a single list
+Apple's order *is* the demand signal, so rank breaks ties — but across two
+different prefixes raw rank is not comparable, and the API documents that.
 
 ### Deduplication
 
 A term surfacing at several rungs collapses to one candidate keeping the
-shortest prefix and that prefix's rank. `surfaced_by` preserves the discarded
-information: a term offered at nine of twelve rungs is a stronger signal than
-one offered at a single long prefix, and collapsing without counting would
-throw that away silently.
+**deepest** prefix and that prefix's rank. Since rungs run longest-first, that
+is simply the first sighting.
+
+`surfaced_by` preserves the discarded information: a term offered at nine of
+twelve rungs is a stronger signal than one offered at a single rung, and
+collapsing without counting would throw that away silently.
 
 ## Tracked terms are excluded by default
 
