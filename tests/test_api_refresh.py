@@ -26,7 +26,10 @@ def stub_refresh(monkeypatch):
     from aso import pipeline
     from aso.api.routes import jobs as jobs_routes
 
-    async def fake_refresh(conn, keywords, *, on_progress=None, **kwargs):
+    calls = []
+
+    async def fake_refresh(conn, keywords, *, on_progress=None, fetcher=None, **kwargs):
+        calls.append(fetcher)
         report = pipeline.RefreshReport(started_at="2026-08-09T00:00:00Z")
         for row in keywords:
             outcome = pipeline.KeywordOutcome(
@@ -39,6 +42,7 @@ def stub_refresh(monkeypatch):
         return report
 
     monkeypatch.setattr(jobs_routes.pipeline, "refresh", fake_refresh)
+    return calls
 
 
 def test_refresh_returns_202_with_a_job_id(client, stub_refresh):
@@ -60,6 +64,12 @@ def test_the_job_reports_progress_and_completion(client, stub_refresh):
     assert body["done"] == 1
     assert body["total"] == 1
     assert body["result"]["succeeded"] == 1
+    # The process owns exactly one Fetcher because it paces at 15 req/min
+    # against a limit that is per IP: a second one on the same box doubles
+    # that rate and starts drawing 403s. A job that built its own would pass
+    # every other assertion here and still be wrong.
+    assert stub_refresh == [client.app.state.aso.fetcher]
+    assert "seq" not in body
 
 
 def test_a_concurrent_refresh_is_refused_with_409(client, monkeypatch):
@@ -83,7 +93,13 @@ def test_a_running_job_can_be_cancelled(client, monkeypatch):
     monkeypatch.setattr(jobs_routes.pipeline, "refresh", never_finishes)
 
     job_id = client.post("/refresh", json={}).json()["id"]
-    assert client.post(f"/jobs/{job_id}/cancel").status_code == 200
+    cancel_response = client.post(f"/jobs/{job_id}/cancel")
+    assert cancel_response.status_code == 200
+    # Not just "eventually cancelled" via a later poll: the cancel response
+    # itself must show the settled state, or a caller reading this body sees
+    # `running` / `finished_at: null`, indistinguishable from nothing having
+    # happened.
+    assert cancel_response.json()["status"] == "cancelled"
 
     for _ in range(50):
         body = client.get(f"/jobs/{job_id}").json()

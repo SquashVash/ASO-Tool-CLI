@@ -7,6 +7,8 @@ keyword, which is where the progress numbers come from.
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException, Request
 
 from ... import pipeline, repository
@@ -85,4 +87,10 @@ async def cancel_job(job_id: str, request: Request) -> JobResponse:
     registry = request.app.state.aso.jobs
     if not await registry.cancel(job_id):
         raise HTTPException(status_code=404, detail=f"No running job {job_id}")
+    # `cancel()` only calls `task.cancel()`; it does not yield, so the task
+    # has provably not resumed yet. Without this yield the response reads
+    # back `status: "running"` — a state transition it caused but cannot
+    # show. One tick is enough: `_run`'s `except asyncio.CancelledError`
+    # unwinds synchronously from here.
+    await asyncio.sleep(0)
     return JobResponse.from_job(registry.get(job_id))

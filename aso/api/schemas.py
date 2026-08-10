@@ -7,7 +7,7 @@ current, and the whole point of this API is that the caller is a machine.
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..repository import split_tags
 
@@ -179,7 +179,12 @@ class LookupResponse(BaseModel):
 class RefreshRequest(BaseModel):
     tag: str | None = None
     country: str | None = None
-    limit: int | None = None
+    # `ge=1`: 0 would silently discard every matched keyword and then read
+    # back as "no keywords match that filter", which is false — they
+    # matched, the limit dropped them. Negative slices from the end of the
+    # list, which is worse: a caller asking for "the first N" would get a
+    # keyword they didn't ask for and no error to notice by.
+    limit: int | None = Field(None, ge=1)
     force: bool = False
     include_inactive: bool = False
 
