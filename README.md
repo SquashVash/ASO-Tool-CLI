@@ -846,6 +846,99 @@ across at least two weeks.
 
 ---
 
+## API
+
+```bash
+uv run aso serve            # http://127.0.0.1:8081
+```
+
+Interactive docs at `/docs`. See `deploy/` for running it under systemd.
+
+### It binds loopback, and it is the only thing that fetches
+
+Two properties, and the second is the one that is easy to get wrong.
+
+**Loopback**, because this tool has no authentication by design — the same
+reason `.streamlit/config.toml` pins the dashboard to localhost. Other services
+on the host can reach it; nothing else can. From a laptop, use an SSH tunnel.
+
+**The only fetcher**, because `aso.http.Fetcher`'s token bucket lives in one
+process. Two processes on one IP means two buckets, roughly 30 req/min against
+a limit that starts returning 403 around 20. So the API owns a single `Fetcher`
+for its lifetime, and the nightly timer POSTs to `/refresh` rather than running
+`aso refresh`. The CLI still works — just don't point its fetching commands at
+Apple while the API is up.
+
+That single shared bucket is also why a live `/lookup` arriving during a
+three-hour refresh returns in seconds rather than waiting for it: the two
+interleave request-by-request instead of queueing behind a lock.
+
+### Endpoints
+
+| | |
+|---|---|
+| `GET /health` | schema version, db path, counts |
+| `GET /keywords` | `country`, `tag`, `keyword`, `sort`, `limit`, `include_inactive`, `include_unscored` |
+| `GET /keywords/{id}` | latest snapshot, components with weights |
+| `GET /keywords/{id}/history` | every snapshot, oldest first |
+| `GET /keywords/{id}/serp` | the current top 10 |
+| `GET /movers` | `days`, `country`, `tag` |
+| `GET /tags`, `GET /countries` | |
+| `POST /keywords` | add; re-posting merges tags |
+| `PATCH /keywords/{id}` | `active`, `tags` (replaces) |
+| `DELETE /keywords/{id}` | permanent; returns what it destroyed |
+| `POST /lookup` | score any keyword live |
+| `POST /refresh` | 202 + job id |
+| `POST /asa/pull`, `POST /popularity/pull` | 202 + job id |
+| `POST /rescore` | synchronous |
+| `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel` | |
+
+Keywords are addressed by id in paths because they contain spaces, unicode, and
+sometimes `/`. `GET /keywords?keyword=…&country=…` is how a caller holding only
+the string finds the id.
+
+Every response carrying a score also carries `captured_at`. A machine that
+cannot tell a fresh score from a three-week-old one will treat stale data as
+current.
+
+### `/lookup` is cached, and pays for the chart index
+
+It reads through the same `http_cache` the CLI does — SERP and autocomplete at
+a 3-day TTL — so a repeat lookup inside that window makes zero requests and
+returns in milliseconds. `requests_made` in the response tells you which
+happened; `"force": true` bypasses it. Stored snapshots are never read, so a
+change to `COMPETITION_WEIGHTS` shows up on the next call either way.
+
+Unlike `aso check`, it supplies the storefront chart index, so `comp_app_power`
+is present and the competition score is comparable to a tracked keyword's.
+That costs ~48 requests once per storefront per day — meaning the first lookup
+of the day can take about four minutes if the nightly refresh has not already
+warmed it. Set your client timeout accordingly.
+
+### Jobs are in memory
+
+A job is an asyncio task in the API process. Restart the service and running
+jobs are cancelled and their records lost — the run's real record was always
+the snapshots in `aso.db`, plus journald. The registry keeps the last 50.
+
+One job per kind: a second `POST /refresh` while one is running gets 409, since
+two runs writing snapshots for an overlapping set is simply wrong. A refresh
+and an ASA pull together are fine.
+
+`POST /jobs/{id}/cancel` returns the job already marked `cancelled`, with its
+partial `done` count intact — the route yields to the event loop once so the
+cancelled task can stamp its own terminal status before the response is built.
+Snapshots the run already committed stay committed.
+
+`POST /refresh` rejects `limit` below 1. Zero would select nothing and then
+report "no keywords match that filter", which is false — keywords matched, the
+limit discarded them.
+
+**Run one worker.** `aso serve` has no `--workers` flag on purpose: two workers
+would mean two token buckets and two job registries behind one URL.
+
+---
+
 ## Data model
 
 Four tables, in `aso/db.py`. `country` is a real column everywhere anything

@@ -1,0 +1,14 @@
+[Unit]
+Description=Nightly aso refresh, via the API
+Requires=aso-api.service
+After=aso-api.service
+
+[Service]
+Type=oneshot
+User=aso
+# Deliberately NOT `aso refresh`. The CLI would open a second token bucket
+# against the same per-IP rate limit as the running API and earn a 403. The
+# API process is the only thing that talks to Apple.
+ExecStart=/usr/bin/curl -fsS --max-time 30 -X POST \
+    -H 'Content-Type: application/json' -d '{}' \
+    http://127.0.0.1:8081/refresh
