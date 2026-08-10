@@ -26,7 +26,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from .repository import CompetitionWrite, DemandWrite
+from .calibration import CompetitionWrite, DemandWrite
 from .scoring.search import SCALE_COUNT, SCALE_ORDINAL_100
 
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from ..repository import split_tags
+from ..store import split_tags
 
 
 class ComponentWeight(BaseModel):
@@ -34,7 +34,7 @@ class KeywordScore(BaseModel):
     @classmethod
     def from_row(cls, row) -> "KeywordScore":
         return cls(
-            keyword_id=row["keyword_id"],
+            keyword_id=row["id"],
             keyword=row["keyword"],
             country=row["country"],
             tags=split_tags(row["tags"]),
@@ -48,7 +48,9 @@ class KeywordScore(BaseModel):
         )
 
 
-class SnapshotRow(BaseModel):
+class ScoreRow(BaseModel):
+    """A keyword's current scores, as last measured."""
+
     captured_at: str
     search_score: float | None
     competition_score: float | None
@@ -60,7 +62,7 @@ class SnapshotRow(BaseModel):
     fetch_error: str | None
 
     @classmethod
-    def from_row(cls, row) -> "SnapshotRow":
+    def from_row(cls, row) -> "ScoreRow":
         return cls(
             captured_at=row["captured_at"],
             search_score=row["search_score"],
@@ -80,23 +82,8 @@ class KeywordDetail(BaseModel):
     country: str
     tags: list[str]
     active: bool
-    latest: SnapshotRow | None
+    latest: ScoreRow | None
     components: list[ComponentWeight]
-
-
-class SerpRow(BaseModel):
-    rank: int
-    track_id: int
-    captured_at: str
-    track_name: str | None
-    seller_name: str | None
-    user_rating_count: int | None
-    average_user_rating: float | None
-    current_version_release_date: str | None
-
-    @classmethod
-    def from_row(cls, row) -> "SerpRow":
-        return cls(**{key: row[key] for key in cls.model_fields})
 
 
 class AddKeywordRequest(BaseModel):
@@ -123,8 +110,6 @@ class PatchKeywordRequest(BaseModel):
 
 class DeleteResponse(BaseModel):
     keywords: int
-    snapshots: int
-    serps: int
 
 
 class LookupRequest(BaseModel):
@@ -228,27 +213,3 @@ class RescoreResponse(BaseModel):
     changed: int
     largest_move: float
     largest_move_keyword: str | None
-    backfilled_extensions: int
-
-
-class MoverRow(BaseModel):
-    """A null delta means *not measured then*, never *did not move*."""
-
-    keyword_id: int
-    keyword: str
-    country: str
-    tags: list[str]
-    captured_at: str
-    baseline_at: str | None
-    opportunity_score: float | None
-    search_score: float | None
-    competition_score: float | None
-    opportunity_delta: float | None
-    search_delta: float | None
-    competition_delta: float | None
-
-    @classmethod
-    def from_row(cls, row) -> "MoverRow":
-        data = {key: row[key] for key in cls.model_fields if key != "tags"}
-        data["tags"] = split_tags(row["tags"])
-        return cls(**data)

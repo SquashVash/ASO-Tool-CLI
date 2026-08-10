@@ -3,22 +3,20 @@ from __future__ import annotations
 import pytest
 
 from aso import config
+from aso import store as store_module
 
 
 def test_competition_weights_sum_to_one() -> None:
     assert sum(config.COMPETITION_WEIGHTS.values()) == pytest.approx(1.0)
 
 
-def test_competition_weight_keys_match_snapshot_columns() -> None:
-    from aso import db
+def test_competition_weight_keys_match_the_stored_score_fields() -> None:
+    """Every weighted component has somewhere to be written.
 
-    conn = db.connect(":memory:")
-    try:
-        db.migrate(conn)
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(snapshots)")}
-    finally:
-        conn.close()
-    assert set(config.COMPETITION_WEIGHTS) <= columns
+    A weight whose name is not a score field would be computed, used, and then
+    silently dropped on write — and `rescore` would read None back for it.
+    """
+    assert set(config.COMPETITION_WEIGHTS) <= set(store_module.SCORE_FIELDS)
 
 
 def test_search_weights_sum_to_one() -> None:

@@ -43,10 +43,9 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 from dataclasses import dataclass, field
 
-from .. import cache
+from ..cache import Cache, default_cache, charts_key
 from ..config import (
     CHART_FEEDS,
     CHART_GENRES,
@@ -148,11 +147,11 @@ class ChartsClient:
     def __init__(
         self,
         fetcher: Fetcher,
-        conn: sqlite3.Connection,
+        cache_store: Cache | None = None,
         config: Settings | None = None,
     ) -> None:
         self.fetcher = fetcher
-        self.conn = conn
+        self.cache = cache_store if cache_store is not None else default_cache
         self.settings = config or default_settings
 
     async def index(self, country: str, *, force: bool = False) -> ChartIndex:
@@ -197,9 +196,9 @@ class ChartsClient:
     async def _feed_body(
         self, country: str, feed: str, genre: int, *, force: bool
     ) -> str | None:
-        key = cache.charts_key(country, feed, genre)
+        key = charts_key(country, feed, genre)
         if not force:
-            cached = cache.get(self.conn, key, CHARTS_TTL_DAYS)
+            cached = self.cache.get(key, CHARTS_TTL_DAYS)
             if cached is not None:
                 return cached.body
 
@@ -214,5 +213,5 @@ class ChartsClient:
             logger.warning("chart feed %s/%s failed for %s: %s", feed, genre, country, exc)
             return None
 
-        cache.put(self.conn, key, CACHE_KIND, body)
+        self.cache.put(key, CACHE_KIND, body)
         return body

@@ -4,16 +4,15 @@ Held on `app.state.aso` and reachable from any handler via `request.app.state`.
 
 This is not the only chart index in the process: `pipeline.refresh` keeps its
 own for the duration of a run. That costs no extra Apple requests, because
-`ChartsClient.index` reads through the SQLite charts cache — the second builder
-of the day gets the same feeds off disk. The two exist because their lifetimes
-differ: one spans a request-serving day, the other one refresh.
+`ChartsClient.index` reads through the process-wide response cache — the second
+builder of the day gets the same feeds from memory. The two exist because their
+lifetimes differ: one spans a request-serving day, the other one refresh.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -29,8 +28,8 @@ logger = logging.getLogger(__name__)
 class AppState:
     fetcher: Fetcher
     # Keyed by (country, UTC date). The index is a property of the storefront
-    # and the day — `charts.CHARTS_TTL_DAYS` expires the SQLite cache daily, so
-    # keying on country alone would let a long-running process serve a
+    # and the day — `charts.CHARTS_TTL_DAYS` expires the response cache daily,
+    # so keying on country alone would let a long-running process serve a
     # week-old index from memory and never notice.
     # Entries for past dates are dropped on the next insert: each `ranks` can
     # hold ~4,800 entries (~0.5MB) and the systemd unit is `Restart=always`
@@ -40,7 +39,7 @@ class AppState:
     chart_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     jobs: JobRegistry = field(default_factory=JobRegistry)
 
-    async def chart_index(self, conn: sqlite3.Connection, country: str) -> ChartIndex:
+    async def chart_index(self, country: str) -> ChartIndex:
         """The storefront's chart index, built at most once per country per day.
 
         Costs ~48 requests (about 3.5 minutes at the paced rate) the first time
@@ -53,7 +52,7 @@ class AppState:
             cached = self.chart_indexes.get(key)
             if cached is not None:
                 return cached
-            client = ChartsClient(self.fetcher, conn, settings)
+            client = ChartsClient(self.fetcher, config=settings)
             index = await client.index(country)
             if not index:
                 # Every feed failed. `ChartsClient.index` never raises, so the

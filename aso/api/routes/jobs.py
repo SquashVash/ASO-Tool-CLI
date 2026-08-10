@@ -8,15 +8,14 @@ keyword, which is where the progress numbers come from.
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 from datetime import date, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from ... import pipeline, repository
+from ... import pipeline
 from ...config import ASA_DEFAULT_LOOKBACK_DAYS, settings
-from ...db import session
-from ..deps import get_conn
+from ...store import Store, session
+from ..deps import get_store
 from ..jobs import Job, JobConflict
 from ..schemas import (
     ASAPullRequest,
@@ -33,9 +32,8 @@ router = APIRouter(tags=["jobs"])
 async def start_refresh(body: RefreshRequest, request: Request) -> JobResponse:
     state = request.app.state.aso
 
-    with session() as conn:
-        selected = repository.list_keywords(
-            conn,
+    with session() as store:
+        selected = store.list_keywords(
             tag=body.tag,
             country=body.country,
             active_only=not body.include_inactive,
@@ -54,12 +52,19 @@ async def start_refresh(body: RefreshRequest, request: Request) -> JobResponse:
             job.done += 1
             job.current = outcome.keyword
 
-        # The connection is opened inside the task and lives as long as the
-        # run. WAL plus autocommit means readers are never blocked by it.
-        with session() as conn:
+        # The store is loaded inside the task and saved when the run ends,
+        # so a refresh started here writes the keyword list once rather
+        # than holding it open across three hours of requests. The reload
+        # also means the run sees whatever the list held at start, not at
+        # the moment the request arrived.
+        with session() as store:
             report = await pipeline.refresh(
-                conn,
-                selected,
+                store,
+                store.list_keywords(
+                    tag=body.tag,
+                    country=body.country,
+                    active_only=not body.include_inactive,
+                )[: body.limit],
                 force=body.force,
                 on_progress=on_progress,
                 fetcher=state.fetcher,
@@ -83,7 +88,7 @@ async def start_refresh(body: RefreshRequest, request: Request) -> JobResponse:
 async def list_jobs(request: Request) -> list[JobResponse]:
     """`async` where the data-reading handlers are `def`, deliberately.
 
-    Those read SQLite and belong in the threadpool. These two read the job
+    Those read the keyword file and belong in the threadpool. These two read the job
     registry, which is plain mutable state owned by the event loop: `_trim`
     pops from `_jobs` and `_run` writes `result` then `status` then
     `finished_at`. From a worker thread, iterating `_jobs.values()` here races
@@ -127,10 +132,9 @@ async def start_asa_pull(body: ASAPullRequest, request: Request) -> JobResponse:
     start = end - timedelta(days=days)
 
     async def run(job: Job) -> dict:
-        with session() as conn:
-            report = await pipeline.pull_asa(
-                conn, start=start, end=end, fetcher=state.fetcher
-            )
+        report = await pipeline.pull_asa(
+            start=start, end=end, fetcher=state.fetcher
+        )
         return {
             "campaigns_seen": report.campaigns_seen,
             "campaigns_skipped": report.campaigns_skipped,
@@ -167,8 +171,8 @@ async def start_popularity_pull(
         )
 
     state = request.app.state.aso
-    with session() as conn:
-        rows = repository.list_keywords(conn, tag=body.tag, country=body.country)
+    with session() as store:
+        rows = store.list_keywords(tag=body.tag, country=body.country)
     if body.limit is not None:
         rows = rows[: body.limit]
     if not rows:
@@ -183,10 +187,9 @@ async def start_popularity_pull(
         # `ApplePopularityError` naming the install command, which propagates
         # to `JobRegistry._run`'s generic handler and lands in `job.error`
         # readable as-is.
-        with session() as conn:
-            report = await pipeline.pull_apple_popularity(
-                conn, terms, country=body.country, fetcher=state.fetcher
-            )
+        report = await pipeline.pull_apple_popularity(
+            terms, country=body.country, fetcher=state.fetcher
+        )
         job.done = job.total
         return {
             "requested": report.requested,
@@ -204,17 +207,16 @@ async def start_popularity_pull(
 
 
 @router.post("/rescore", response_model=RescoreResponse)
-def rescore(conn: sqlite3.Connection = Depends(get_conn)) -> RescoreResponse:
+def rescore(store: Store = Depends(get_store)) -> RescoreResponse:
     """Recompute every stored score from its saved components.
 
     Synchronous, and a `def` so it runs in the threadpool: it touches no
     network, so there is nothing to pace and nothing to watch.
     """
-    report = pipeline.rescore(conn)
+    report = pipeline.rescore(store)
     return RescoreResponse(
         total=report.total,
         changed=report.changed,
         largest_move=report.largest_move,
         largest_move_keyword=report.largest_move_keyword,
-        backfilled_extensions=report.backfilled_extensions,
     )

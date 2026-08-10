@@ -1,44 +1,52 @@
-"""Orchestration: refresh a set of keywords and write a snapshot each.
+"""Orchestration: refresh a set of keywords and record the scores.
 
 Per keyword, in order:
 
 1. fetch the SERP (cached 3 days) and score competition,
 2. walk the autocomplete prefix ladder (cached 3 days) and score search volume,
 3. combine into opportunity,
-4. write one `snapshots` row plus the ranking into `serps`.
+4. write the scores onto the keyword's record, replacing what was there.
 
 Three properties this module exists to guarantee:
 
 **Failures are recorded, not fatal.** A keyword whose SERP or hints can't be
-fetched still gets a snapshot row, with `fetch_failed = 1`, the error text, and
-whatever scores did succeed. The run continues. A 500-keyword refresh must not
-die on keyword 300 because Apple rate-limited one request.
+fetched still gets its record updated, with `fetch_failed = 1`, the error text,
+and whatever scores did succeed. The run continues. A 500-keyword refresh must
+not die on keyword 300 because Apple rate-limited one request.
 
 **Partial results stay partial.** If the SERP succeeds and hints fail, the
 competition score and its components are written and the search score stays
-NULL — never zero, never a guess. `opportunity` is NULL whenever either input
+None — never zero, never a guess. `opportunity` is None whenever either input
 is, so a half-measured keyword can't outrank a fully measured one.
 
-**Runs are resumable.** Each keyword commits its own transaction, and every
-response is cached on disk, so Ctrl-C and restart costs only the keyword that
-was in flight.
+**A run is written once.** The keyword list is a single JSON file, so the
+scores accumulate in memory and are saved when the run ends, rather than being
+rewritten per keyword. A run interrupted partway therefore records nothing —
+the trade for no longer holding a database open, and the reason `refresh`
+reports what it wrote rather than leaving the caller to assume.
 
 Keywords are processed sequentially. Concurrency would buy nothing: the shared
-token bucket serializes every request anyway, and interleaving transactions on
-one SQLite connection would break the per-keyword atomicity above.
+token bucket serializes every request anyway.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import logging
-import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from typing import Any
 
-from . import cache
-from .clients import apple_popularity, asa, hints
+from .calibration import (
+    DemandWrite,
+    demand_map,
+    demand_samples,
+    latest_bridge,
+    to_bridge,
+    write_demand_observations,
+)
+from .clients import apple_popularity, asa
 from .clients.charts import ChartIndex, ChartsClient
 from .clients.hints import HintsClient, UnknownStorefront
 from .clients.itunes import ITunesClient
@@ -49,22 +57,9 @@ from .config import (
     Settings,
 )
 from .config import settings as default_settings
-from .db import transaction, utcnow
+from .files import utcnow
 from .http import Fetcher, FetchError
-from .repository import (
-    ASATermWrite,
-    DemandWrite,
-    SnapshotWrite,
-    all_snapshots_for_rescoring,
-    apple_demand_map,
-    calibration_samples,
-    latest_bridge,
-    update_snapshot_scores,
-    write_asa_terms,
-    write_demand_observations,
-    write_serp,
-    write_snapshot,
-)
+from .store import Store
 from .scoring import competition, search
 from .scoring.blend import blend
 from .scoring.bridge import Bridge
@@ -234,15 +229,14 @@ async def score_keyword(
     )
 
 
-def blend_outcome(
-    conn: sqlite3.Connection, outcome: KeywordOutcome
-) -> KeywordOutcome:
+def blend_outcome(outcome: KeywordOutcome) -> KeywordOutcome:
     """Apply a measured demand value to an ad-hoc score, in place.
 
-    `score_keyword` deliberately touches no table, so it can only ever produce
-    the proxy. That is correct for what it is and wrong for what a caller
-    wants: a keyword we have already measured should not be reported at its
-    guessed value just because this code path does not read the database.
+    `score_keyword` deliberately reads no stored data, so it can only ever
+    produce the proxy. That is correct for what it is and wrong for what a
+    caller wants: a keyword we have already measured should not be reported at
+    its guessed value just because this code path does not read the
+    observations.
 
     Without this, `aso check "75 hard"` answered 70.7 while every stored
     snapshot of the same keyword read 9.0 — the same keyword, two numbers, and
@@ -253,15 +247,10 @@ def blend_outcome(
     changed.
     """
     outcome.search_score_proxy = outcome.search_score
-    value, censored = apple_demand_map(conn).get(
+    value, censored = demand_map().get(
         (search.normalize_keyword(outcome.keyword), outcome.country), (None, False)
     )
-    row = latest_bridge(conn, country=outcome.country)
-    fitted = (
-        Bridge.from_json(row["knots"], n_overlap=row["n_overlap"], rmse=row["rmse"] or 0.0)
-        if row is not None
-        else None
-    )
+    fitted = to_bridge(latest_bridge(country=outcome.country))
 
     blended = blend(
         outcome.search_score, apple_value=value, censored=censored, bridge=fitted
@@ -276,7 +265,6 @@ def blend_outcome(
 
 
 def bridge_outcome(
-    conn: sqlite3.Connection,
     outcome: KeywordOutcome,
     *,
     bridge: Bridge | None = None,
@@ -288,7 +276,7 @@ def bridge_outcome(
     raw score — correct for what that function is, and wrong for what every
     caller wants. A keyword whose storefront has a fitted scale must not be
     reported on the unfitted one just because this code path does not read the
-    database.
+    fitted bridges.
 
     Without this, `aso check "habit tracker"` answered 42.0 while a stored
     snapshot of the same keyword read 80-odd: the same keyword, two numbers,
@@ -301,9 +289,7 @@ def bridge_outcome(
     changed — linearly, which is why the level matters here at all.
     """
     outcome.competition_score_raw = outcome.competition_score
-    fitted = bridge if bridge is not None else _load_competition_bridge(
-        conn, outcome.country
-    )
+    fitted = bridge if bridge is not None else _load_competition_bridge(outcome.country)
     if fitted is not None and outcome.competition_score is not None:
         outcome.competition_score = fitted.apply(outcome.competition_score)
     outcome.opportunity_score = opportunity(
@@ -312,24 +298,18 @@ def bridge_outcome(
     return outcome
 
 
-def _load_competition_bridge(
-    conn: sqlite3.Connection, country: str
-) -> Bridge | None:
+def _load_competition_bridge(country: str) -> Bridge | None:
     """The stored competition level bridge for one storefront, if any.
 
     `metric="competition"` is what keeps this from picking up a demand bridge
-    fitted for the same storefront — see db.py migration 16.
+    fitted for the same storefront.
     """
-    row = latest_bridge(
-        conn,
-        country=country,
-        source=COMPETITION_BRIDGE_SOURCE,
-        metric="competition",
-    )
-    if row is None:
-        return None
-    return Bridge.from_json(
-        row["knots"], n_overlap=row["n_overlap"], rmse=row["rmse"] or 0.0
+    return to_bridge(
+        latest_bridge(
+            country=country,
+            source=COMPETITION_BRIDGE_SOURCE,
+            metric="competition",
+        )
     )
 
 
@@ -338,7 +318,7 @@ async def refresh_keyword(
     keyword: str,
     country: str,
     *,
-    conn: sqlite3.Connection,
+    store: Store,
     itunes: ITunesClient,
     hints: HintsClient,
     force: bool = False,
@@ -347,10 +327,11 @@ async def refresh_keyword(
     charts: ChartIndex | None = None,
     competition_bridge: Bridge | None = None,
 ) -> KeywordOutcome:
-    """Refresh one keyword and write its snapshot. Never raises for a fetch failure.
+    """Refresh one keyword and record its scores. Never raises for a fetch failure.
 
-    `competition_bridge` is looked up per storefront when not supplied. `refresh`
-    passes it so a 500-keyword run does one lookup per country instead of 500.
+    Writes into `store` in memory; the caller saves. `competition_bridge` is
+    looked up per storefront when not supplied — `refresh` passes it so a
+    500-keyword run does one lookup per country instead of 500.
     """
     config = config or default_settings
     captured_at = utcnow()
@@ -366,17 +347,16 @@ async def refresh_keyword(
         charts=charts,
     )
     outcome = scored.outcome
-    serp_captured_at = scored.serp.captured_at if scored.serp is not None else None
-    track_ids = (
-        [app.track_id for app in scored.serp.apps] if scored.serp is not None else []
-    )
 
-    bridge_outcome(conn, outcome, bridge=competition_bridge)
+    bridge_outcome(outcome, bridge=competition_bridge)
+    blend_outcome(outcome)
 
-    snapshot = SnapshotWrite(
-        keyword_id=keyword_id,
+    store.write_scores(
+        keyword_id,
         captured_at=captured_at,
         search_score=outcome.search_score,
+        search_score_proxy=outcome.search_score_proxy,
+        search_source=outcome.search_source,
         competition_score=outcome.competition_score,
         competition_score_raw=outcome.competition_score_raw,
         opportunity_score=outcome.opportunity_score,
@@ -387,12 +367,6 @@ async def refresh_keyword(
         fetch_error=outcome.error,
         **scored.components,
     )
-
-    with transaction(conn):
-        write_snapshot(conn, snapshot)
-        if serp_captured_at is not None and track_ids:
-            write_serp(conn, keyword_id, serp_captured_at, track_ids)
-
     return outcome
 
 
@@ -402,68 +376,19 @@ class RescoreReport:
     changed: int = 0
     largest_move: float = 0.0
     largest_move_keyword: str | None = None
-    backfilled_extensions: int = 0
 
 
-def backfill_extensions(conn: sqlite3.Connection) -> int:
-    """Fill `search_hint_extensions` on snapshots taken before it existed.
-
-    Reads the local HTTP cache, not Apple: every ladder walk's first rung is
-    the keyword's own full-length prefix, so the suggestion list this count
-    comes from was already fetched and stored. Recovering it needs no request.
-
-    Returns how many rows were filled. Snapshots whose cached response has
-    since been purged keep NULL, which the scorer reads as "not measured" and
-    renormalizes around — a wrong 0 there would claim Apple offered no
-    completions when nobody looked.
-
-    Only ever writes NULL cells. A stored count is a measurement and is never
-    overwritten by a re-derived one.
-    """
-    rows = conn.execute(
-        """
-        SELECT s.id, k.keyword, k.country
-        FROM snapshots s
-        JOIN keywords k ON k.id = s.keyword_id
-        WHERE s.search_hint_extensions IS NULL
-          AND s.fetch_failed = 0
-        """
-    ).fetchall()
-    filled = 0
-    for row in rows:
-        keyword = search.normalize_keyword(row["keyword"])
-        cached = conn.execute(
-            "SELECT body FROM http_cache WHERE cache_key = ?",
-            (cache.hints_key(keyword, row["country"]),),
-        ).fetchone()
-        if cached is None:
-            continue
-        try:
-            terms = hints.parse_hints(cached["body"])
-        except ValueError:
-            logger.warning("cached hints for %r were unparseable", keyword)
-            continue
-        conn.execute(
-            "UPDATE snapshots SET search_hint_extensions = ? WHERE id = ?",
-            (search._extensions_of(keyword, terms), row["id"]),
-        )
-        filled += 1
-    return filled
-
-
-def rescore(conn: sqlite3.Connection, *, config: Settings | None = None) -> RescoreReport:
-    """Recompute every stored snapshot's three finals from its own components.
+def rescore(store: Store, *, config: Settings | None = None) -> RescoreReport:
+    """Recompute every keyword's three finals from its own stored components.
 
     Makes no network requests. This is the payoff for storing components next
-    to finals: change `COMPETITION_WEIGHTS` or the search mapping and the whole
-    history moves with it, so trend charts compare like with like instead of
-    silently splicing two different scoring schemes together.
+    to finals: change `COMPETITION_WEIGHTS` or the search mapping, run this,
+    and every keyword moves onto the new scheme without re-asking Apple.
 
     Only the finals are rewritten. Components and the raw ladder observations
-    are inputs and stay exactly as captured — with the single exception of
-    `backfill_extensions`, which fills a column that did not exist when older
-    snapshots were written and derives it from the cached response those very
-    snapshots were built from.
+    are inputs and stay exactly as captured.
+
+    Mutates `store` in memory; the caller saves.
     """
     config = config or default_settings
     report = RescoreReport()
@@ -471,148 +396,130 @@ def rescore(conn: sqlite3.Connection, *, config: Settings | None = None) -> Resc
     # Apple's readings and the fitted bridges, loaded once. Both are empty on a
     # tool that has never pulled popularity, and every branch below then takes
     # its pre-blend path — which is why enabling none of this changes any score.
-    demand = apple_demand_map(conn)
+    demand = demand_map()
     bridges: dict[str, Bridge | None] = {}
+    comp_bridges: dict[str, Bridge | None] = {}
 
     def bridge_for(country: str) -> Bridge | None:
         if country not in bridges:
-            row = latest_bridge(conn, country=country)
-            bridges[country] = (
-                Bridge.from_json(row["knots"], n_overlap=row["n_overlap"], rmse=row["rmse"] or 0.0)
-                if row is not None
-                else None
-            )
+            bridges[country] = to_bridge(latest_bridge(country=country))
         return bridges[country]
 
     # The competition-side twin, keyed separately. Same object, different
-    # metric: `latest_bridge`'s `metric` argument is what keeps a demand
-    # bridge and a competition bridge from being mistaken for each other.
-    comp_bridges: dict[str, Bridge | None] = {}
-
+    # metric: `latest_bridge`'s `metric` argument is what keeps a demand bridge
+    # and a competition bridge from being mistaken for each other.
     def comp_bridge_for(country: str) -> Bridge | None:
         if country not in comp_bridges:
-            row = latest_bridge(
-                conn,
-                country=country,
-                source=COMPETITION_BRIDGE_SOURCE,
-                metric="competition",
-            )
-            comp_bridges[country] = (
-                Bridge.from_json(row["knots"], n_overlap=row["n_overlap"], rmse=row["rmse"] or 0.0)
-                if row is not None
-                else None
-            )
+            comp_bridges[country] = _load_competition_bridge(country)
         return comp_bridges[country]
 
-    with transaction(conn):
-        report.backfilled_extensions = backfill_extensions(conn)
+    for record in store.records:
+        if not record.get("captured_at") or record.get("fetch_failed"):
+            continue
+        report.total += 1
+        country = record["country"]
 
-        for row in all_snapshots_for_rescoring(conn):
-            report.total += 1
+        # `derive` recomputes comp_incumbent from the two stored measurements
+        # rather than reading the stored value, so a change to the formula
+        # reaches every record here instead of being frozen into whatever each
+        # one was captured under.
+        comp_components = competition.derive(
+            {name: record.get(name) for name in competition.COMPETITION_WEIGHTS}
+        )
+        comp_raw = competition.combine(
+            comp_components, weights=config.competition_weights
+        )
+        # The bridge maps our raw score onto the vendor's level. It is applied
+        # here rather than folded into `combine` so the pre-bridge number
+        # survives in its own field — which is what stops the next rescore
+        # bridging an already-bridged score, exactly as `search_score_proxy`
+        # does on the demand side.
+        comp_bridge = comp_bridge_for(country)
+        comp_score = (
+            comp_raw
+            if comp_raw is None or comp_bridge is None
+            else comp_bridge.apply(comp_raw)
+        )
 
-            # `derive` recomputes comp_incumbent from the two stored
-            # measurements rather than reading the stored column, so a change
-            # to the formula reaches history here instead of being frozen into
-            # whatever each row was captured under.
-            comp_components = competition.derive(
-                {name: row[name] for name in competition.COMPETITION_WEIGHTS}
-            )
-            comp_raw = competition.combine(
-                comp_components, weights=config.competition_weights
-            )
-            # The bridge maps our raw score onto the vendor's level. It is
-            # applied here rather than folded into `combine` so the pre-bridge
-            # number survives in its own column — which is what stops the next
-            # rescore bridging an already-bridged score, exactly as
-            # `search_score_proxy` does on the demand side.
-            comp_bridge = comp_bridge_for(row["keyword_country"])
-            comp_score = (
-                comp_raw
-                if comp_raw is None or comp_bridge is None
-                else comp_bridge.apply(comp_raw)
+        depth = record.get("search_prefix_depth")
+        rank = record.get("search_hint_rank")
+        if depth is None and rank is None and record.get("search_score") is None:
+            # Hints never succeeded for this keyword. Nothing to recompute
+            # from, and inventing the no-match floor would turn a failed fetch
+            # into a measurement.
+            proxy_score = None
+        else:
+            length = len(search.normalize_keyword(record["keyword"]))
+            proxy_score = search.score_from_observations(
+                depth,
+                rank,
+                length,
+                extensions=record.get("search_hint_extensions"),
+                # Zero-weighted today; passed so that re-enabling it in config
+                # rescores everything without a change of stored shape.
+                rating_mass=record.get("comp_rating_count"),
             )
 
-            depth = row["search_prefix_depth"]
-            rank = row["search_hint_rank"]
-            if depth is None and rank is None and row["search_score"] is None:
-                # Hints never succeeded for this snapshot. Nothing to recompute
-                # from, and inventing the no-match floor would turn a failed
-                # fetch into a measurement.
-                proxy_score = None
-            else:
-                length = len(search.normalize_keyword(row["keyword_text"]))
-                proxy_score = search.score_from_observations(
-                    depth,
-                    rank,
-                    length,
-                    extensions=row["search_hint_extensions"],
-                    # Zero-weighted today; passed so that re-enabling it in
-                    # config re-scores history without a schema change.
-                    rating_mass=row["comp_rating_count"],
-                )
+        # Blend Apple's measurement over the proxy where one exists. With no
+        # popularity pulled, `measured` is (None, False) for every keyword and
+        # `blend` returns the bridged — i.e. unchanged — proxy.
+        apple_value, censored = demand.get(
+            (search.normalize_keyword(record["keyword"]), country), (None, False)
+        )
+        blended = blend(
+            proxy_score,
+            apple_value=apple_value,
+            censored=censored,
+            bridge=bridge_for(country),
+        )
+        search_score = blended.value if blended is not None else None
+        search_source = blended.source if blended is not None else None
+        opp = opportunity(search_score, comp_score)
 
-            # Blend Apple's measurement over the proxy where one exists. With
-            # no popularity pulled, `measured` is (None, False) for every
-            # keyword and `blend` returns the bridged — i.e. unchanged — proxy.
-            country = row["keyword_country"]
-            apple_value, censored = demand.get(
-                (search.normalize_keyword(row["keyword_text"]), country), (None, False)
-            )
-            blended = blend(
-                proxy_score,
-                apple_value=apple_value,
-                censored=censored,
-                bridge=bridge_for(country),
-            )
-            search_score = blended.value if blended is not None else None
-            search_source = blended.source if blended is not None else None
-
-            opp = opportunity(search_score, comp_score)
-
-            before = row["opportunity_score"]
-            update_snapshot_scores(
-                conn,
-                row["id"],
-                search_score=search_score,
-                competition_score=comp_score,
-                opportunity_score=opp,
-                search_score_proxy=proxy_score,
-                search_source=search_source,
-                comp_incumbent=comp_components["comp_incumbent"],
-                competition_score_raw=comp_raw,
-            )
-            if before != opp:
-                report.changed += 1
-                if before is not None and opp is not None:
-                    move = abs(opp - before)
-                    if move > report.largest_move:
-                        report.largest_move = move
-                        report.largest_move_keyword = row["keyword_text"]
+        before = record.get("opportunity_score")
+        store.update_scores(
+            int(record["id"]),
+            search_score=search_score,
+            competition_score=comp_score,
+            opportunity_score=opp,
+            search_score_proxy=proxy_score,
+            search_source=search_source,
+            comp_incumbent=comp_components["comp_incumbent"],
+            competition_score_raw=comp_raw,
+        )
+        if before != opp:
+            report.changed += 1
+            if before is not None and opp is not None:
+                move = abs(opp - before)
+                if move > report.largest_move:
+                    report.largest_move = move
+                    report.largest_move_keyword = record["keyword"]
 
     return report
 
 
 async def refresh(
-    conn: sqlite3.Connection,
-    keywords: Sequence[sqlite3.Row],
+    store: Store,
+    keywords: Sequence[dict[str, Any]],
     *,
     force: bool = False,
     config: Settings | None = None,
     on_progress: ProgressCallback | None = None,
     fetcher: Fetcher | None = None,
 ) -> RefreshReport:
-    """Refresh every keyword in `keywords`, writing one snapshot each.
+    """Refresh every keyword in `keywords`, recording the scores on each.
 
     A single `Fetcher` is shared by both clients so iTunes and autocomplete
-    traffic draw on the same per-IP rate limit.
+    traffic draw on the same per-IP rate limit. Mutates `store` in memory; the
+    caller saves once the run finishes.
     """
     config = config or default_settings
     report = RefreshReport(started_at=utcnow())
 
     async def run(active: Fetcher) -> None:
-        itunes = ITunesClient(active, conn, config)
-        hints = HintsClient(active, conn, config)
-        charts_client = ChartsClient(active, conn, config)
+        itunes = ITunesClient(active, config=config)
+        hints = HintsClient(active, config=config)
+        charts_client = ChartsClient(active, config=config)
         # One index per storefront, built on first use and reused for every
         # keyword in that market. The index is a property of the country and
         # the day, not of the keyword, so building it per keyword would repeat
@@ -628,12 +535,12 @@ async def refresh(
             if country not in indexes:
                 indexes[country] = await charts_client.index(country)
             if country not in comp_bridges:
-                comp_bridges[country] = _load_competition_bridge(conn, country)
+                comp_bridges[country] = _load_competition_bridge(country)
             outcome = await refresh_keyword(
                 row["id"],
                 row["keyword"],
                 row["country"],
-                conn=conn,
+                store=store,
                 itunes=itunes,
                 hints=hints,
                 force=force,
@@ -682,7 +589,6 @@ class ASAPullReport:
 
 
 async def pull_asa(
-    conn: sqlite3.Connection,
     *,
     start: date,
     end: date,
@@ -692,21 +598,30 @@ async def pull_asa(
 ) -> ASAPullReport:
     """Pull search-term impressions for every campaign in the configured org.
 
-    Each campaign commits its own transaction, so a credential expiring or a
-    report timing out halfway through leaves the campaigns already pulled
-    safely stored — same resumability property as `refresh`.
+    Campaigns targeting more than one country are pulled but contribute no
+    observation. Attributing a search term to one of several storefronts would
+    be a guess, and calibration is the one place in this tool where a guess
+    defeats the entire purpose. The campaign is named in `campaigns_skipped` so
+    the omission is visible rather than silent.
 
-    Campaigns targeting more than one country are pulled but stored with a NULL
-    country, which excludes them from calibration. Attributing a search term to
-    one of several storefronts would be a guess, and calibration is the one
-    place in this tool where a guess defeats the entire purpose.
+    **Impressions are summed across campaigns, then written.** Two campaigns
+    bidding on the same term saw genuinely different impressions and those add
+    up; an observation is keyed on (source, keyword, country), so writing each
+    campaign's figure as it arrived would leave the last one standing and
+    silently discard the rest. The totals are accumulated here and written
+    after every campaign, so the running figure on disk is always a correct
+    total of the campaigns pulled so far — a credential expiring halfway
+    through leaves a smaller number, never a wrong one.
+
+    Re-running the same window is therefore safe: the totals start empty each
+    run and replace what was stored rather than adding to it.
     """
     config = config or default_settings
     report = ASAPullReport(start=start.isoformat(), end=end.isoformat())
 
     async def run(active: Fetcher) -> None:
         api = client or asa.ASAClient(active, config)
-        org_id = config.asa.org_id or ""
+        totals: dict[tuple[str, str], float] = {}
 
         for campaign in await api.campaigns():
             report.campaigns_seen += 1
@@ -718,43 +633,27 @@ async def pull_asa(
                 )
 
             rows = await api.search_terms(campaign.campaign_id, start=start, end=end)
-            writes = [
-                ASATermWrite(
-                    org_id=org_id,
-                    campaign_id=campaign.campaign_id,
-                    search_term=row.search_term,
-                    country=country,
-                    impressions=row.impressions,
-                    taps=row.taps,
-                    installs=row.installs,
-                    start_date=report.start,
-                    end_date=report.end,
-                )
-                for row in rows
-            ]
-            # Also project into the flat demand table, which is what
-            # calibration reads. Only single-country campaigns qualify: a term
-            # from a multi-country campaign cannot be attributed to a
-            # storefront, and calibration joins on (keyword, country).
-            demand = (
+            if country is None:
+                continue
+            for row in rows:
+                if row.impressions <= 0:
+                    continue
+                key = (search.normalize_keyword(row.search_term), country.lower())
+                totals[key] = totals.get(key, 0.0) + float(row.impressions)
+
+            write_demand_observations(
                 [
                     DemandWrite(
                         source="asa",
                         scale=search.SCALE_COUNT,
-                        keyword=row.search_term,
-                        country=country,
-                        value=float(row.impressions),
+                        keyword=keyword,
+                        country=term_country,
+                        value=value,
                     )
-                    for row in rows
-                    if row.impressions > 0
+                    for (keyword, term_country), value in totals.items()
                 ]
-                if country is not None
-                else []
             )
-
-            with transaction(conn):
-                report.terms_written += write_asa_terms(conn, writes)
-                write_demand_observations(conn, demand)
+            report.terms_written = len(totals)
 
         report.requests_made = active.requests_made
 
@@ -769,9 +668,7 @@ async def pull_asa(
     return report
 
 
-def calibration_from_db(
-    conn: sqlite3.Connection, source: str
-) -> list[search.CalibrationSample]:
+def calibration_for(source: str, store: Store | None = None) -> list[search.CalibrationSample]:
     """Build calibration samples for one source's measured demand.
 
     One source at a time, deliberately. An impression count and an ordinal
@@ -779,7 +676,7 @@ def calibration_from_db(
     produce a number that means nothing.
     """
     samples = []
-    for row in calibration_samples(conn, source):
+    for row in demand_samples(source, store):
         length = len(search.normalize_keyword(row["keyword"]))
         samples.append(
             search.CalibrationSample(
@@ -811,7 +708,6 @@ class PopularityPullReport:
 
 
 async def pull_apple_popularity(
-    conn: sqlite3.Connection,
     keywords: Sequence[str],
     *,
     country: str,
@@ -822,20 +718,20 @@ async def pull_apple_popularity(
 ) -> PopularityPullReport:
     """Fetch Apple's popularity index and store it as demand observations.
 
-    Writes into the same `demand_observations` table AppFigures and ASA use,
-    under source 'apple' and scale 'ordinal_100'. Nothing about calibration or
-    scoring needs to learn a new kind of thing exists — which is what that
-    table's `source` column was for.
+    Writes into the same demand observations AppFigures and ASA use, under
+    source 'apple' and scale 'ordinal_100'. Nothing about calibration or
+    scoring needs to learn a new kind of thing exists — which is what the
+    `source` field was for.
 
     Censored readings are stored with `censored = 1`. They train nothing
-    (`calibration_samples` filters `value > 0`) and bound everything
+    (`calibration.demand_samples` filters `value > 0`) and bound everything
     (`scoring.blend` caps the proxy at Apple's floor for them).
 
     `store_related` also keeps the terms that arrived attached to somebody
     else's seed. Those are real Apple measurements obtained for no extra
     request, and they are what makes one pull worth far more than the keywords
-    it asked about. They are NOT added to `keywords` — measuring a term is not
-    a decision to track it.
+    it asked about. They are NOT added to the keyword list — measuring a term
+    is not a decision to track it.
     """
     config = config or default_settings
     report = PopularityPullReport(requested=len(keywords))
@@ -853,7 +749,7 @@ async def pull_apple_popularity(
             # it and drives its own profile. `build_transport` decides which,
             # and raises with the specific remedy when neither is available.
             transport = apple_popularity.build_transport(config, fetcher=fetcher)
-            client = apple_popularity.ApplePopularityClient(transport, conn, config)
+            client = apple_popularity.ApplePopularityClient(transport, config=config)
         result = await client.popularity(keywords, country)
     finally:
         if transport is not None:
@@ -895,6 +791,5 @@ async def pull_apple_popularity(
                 )
             )
 
-    with transaction(conn):
-        write_demand_observations(conn, writes)
+    write_demand_observations(writes)
     return report

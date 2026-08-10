@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 
 import httpx
 import pytest
 import respx
 
+from aso import cache
 from aso.clients import itunes
 from aso.http import FetchError
 
@@ -20,8 +20,8 @@ def fixture_body() -> str:
     return REAL_FIXTURE.read_text(encoding="utf-8")
 
 
-def client(conn: sqlite3.Connection, fetcher) -> itunes.ITunesClient:
-    return itunes.ITunesClient(fetcher, conn)
+def client(store: store_module.Store, fetcher) -> itunes.ITunesClient:
+    return itunes.ITunesClient(fetcher)
 
 
 # --- parsing ---------------------------------------------------------------
@@ -130,10 +130,10 @@ def test_malformed_body_raises_rather_than_returning_empty() -> None:
 
 
 @respx.mock
-async def test_search_fetches_then_serves_from_cache(conn: sqlite3.Connection) -> None:
+async def test_search_fetches_then_serves_from_cache(store: store_module.Store) -> None:
     route = respx.get(URL).mock(return_value=httpx.Response(200, text=fixture_body()))
     async with fast_fetcher() as fetcher:
-        api = client(conn, fetcher)
+        api = client(store, fetcher)
         first = await api.search("candlestick patterns", "us")
         second = await api.search("candlestick patterns", "us")
 
@@ -144,10 +144,10 @@ async def test_search_fetches_then_serves_from_cache(conn: sqlite3.Connection) -
 
 
 @respx.mock
-async def test_search_sends_the_documented_parameters(conn: sqlite3.Connection) -> None:
+async def test_search_sends_the_documented_parameters(store: store_module.Store) -> None:
     route = respx.get(URL).mock(return_value=httpx.Response(200, text=fixture_body()))
     async with fast_fetcher() as fetcher:
-        await client(conn, fetcher).search("day trading", "de", limit=25)
+        await client(store, fetcher).search("day trading", "de", limit=25)
     params = route.calls[0].request.url.params
     assert params["term"] == "day trading"
     assert params["entity"] == "software"
@@ -156,103 +156,58 @@ async def test_search_sends_the_documented_parameters(conn: sqlite3.Connection) 
 
 
 @respx.mock
-async def test_cache_is_scoped_per_storefront(conn: sqlite3.Connection) -> None:
+async def test_cache_is_scoped_per_storefront(store: store_module.Store) -> None:
     route = respx.get(URL).mock(return_value=httpx.Response(200, text=fixture_body()))
     async with fast_fetcher() as fetcher:
-        api = client(conn, fetcher)
+        api = client(store, fetcher)
         await api.search("forex", "us")
         await api.search("forex", "gb")
     assert route.call_count == 2
 
 
 @respx.mock
-async def test_force_bypasses_the_cache(conn: sqlite3.Connection) -> None:
+async def test_force_bypasses_the_cache(store: store_module.Store) -> None:
     route = respx.get(URL).mock(return_value=httpx.Response(200, text=fixture_body()))
     async with fast_fetcher() as fetcher:
-        api = client(conn, fetcher)
+        api = client(store, fetcher)
         await api.search("forex", "us")
         await api.search("forex", "us", force=True)
     assert route.call_count == 2
 
 
 @respx.mock
-async def test_cache_survives_a_new_connection(tmp_path) -> None:
-    """The cache is on disk, which is what makes a run resumable."""
-    from aso import db
+async def test_a_second_client_shares_the_process_cache() -> None:
+    """One process, one cache: the second client pays nothing.
 
-    path = tmp_path / "resume.db"
-    first_conn = db.connect(path)
-    db.migrate(first_conn)
+    This used to assert the cache survived a new *connection*, because it
+    lived on disk. It no longer does — see `cache.py` — so what is worth
+    pinning now is that two clients in one process still share it.
+    """
     route = respx.get(URL).mock(return_value=httpx.Response(200, text=fixture_body()))
+    shared = cache.Cache()
     async with fast_fetcher() as fetcher:
-        await client(first_conn, fetcher).search("forex", "us")
-    first_conn.close()
-
-    second_conn = db.connect(path)
+        await itunes.ITunesClient(fetcher, shared).search("forex", "us")
     async with fast_fetcher() as fetcher:
-        serp = await client(second_conn, fetcher).search("forex", "us")
-    second_conn.close()
+        serp = await itunes.ITunesClient(fetcher, shared).search("forex", "us")
 
     assert route.call_count == 1
     assert serp.from_cache is True
 
 
 @respx.mock
-async def test_search_caches_app_metadata(conn: sqlite3.Connection) -> None:
-    respx.get(URL).mock(return_value=httpx.Response(200, text=fixture_body()))
-    async with fast_fetcher() as fetcher:
-        serp = await client(conn, fetcher).search("candlestick patterns", "us")
-
-    stored = conn.execute("SELECT COUNT(*) FROM apps WHERE country = 'us'").fetchone()[0]
-    assert stored == len(serp.apps)
-
-    app = itunes.load_app(conn, serp.apps[0].track_id, "us")
-    assert app is not None
-    assert app.track_name == serp.apps[0].track_name
-    assert app.genres == serp.apps[0].genres
-
-
-@respx.mock
-async def test_app_metadata_is_stored_per_storefront(conn: sqlite3.Connection) -> None:
-    respx.get(URL).mock(return_value=httpx.Response(200, text=fixture_body()))
-    async with fast_fetcher() as fetcher:
-        api = client(conn, fetcher)
-        await api.search("forex", "us")
-        await api.search("forex", "jp")
-    countries = {
-        row["country"] for row in conn.execute("SELECT DISTINCT country FROM apps")
-    }
-    assert countries == {"us", "jp"}
-
-
-@respx.mock
-async def test_cache_hit_does_not_refresh_app_fetched_at(conn: sqlite3.Connection) -> None:
-    """A cached body is as old as the cache entry; refreshing fetched_at on a
-    cache hit would keep the 7-day app cache looking fresh forever."""
-    respx.get(URL).mock(return_value=httpx.Response(200, text=fixture_body()))
-    async with fast_fetcher() as fetcher:
-        api = client(conn, fetcher)
-        await api.search("forex", "us")
-        conn.execute("UPDATE apps SET fetched_at = '2020-01-01T00:00:00Z'")
-        await api.search("forex", "us")
-    stamps = {row["fetched_at"] for row in conn.execute("SELECT fetched_at FROM apps")}
-    assert stamps == {"2020-01-01T00:00:00Z"}
-
-
-@respx.mock
-async def test_failed_fetch_propagates_and_caches_nothing(conn: sqlite3.Connection) -> None:
+async def test_failed_fetch_propagates_and_caches_nothing(store: store_module.Store) -> None:
     respx.get(URL).mock(return_value=httpx.Response(403, text="rate limited"))
     async with fast_fetcher(retry_attempts=2) as fetcher:
         with pytest.raises(FetchError):
-            await client(conn, fetcher).search("forex", "us")
-    assert conn.execute("SELECT COUNT(*) FROM http_cache").fetchone()[0] == 0
+            await client(store, fetcher).search("forex", "us")
+    assert cache.default_cache.stats() == {}
 
 
 @respx.mock
-async def test_unparseable_response_is_not_cached(conn: sqlite3.Connection) -> None:
+async def test_unparseable_response_is_not_cached(store: store_module.Store) -> None:
     """Otherwise a bad response poisons the cache for three days."""
     respx.get(URL).mock(return_value=httpx.Response(200, text="<html>oops</html>"))
     async with fast_fetcher() as fetcher:
         with pytest.raises(ValueError):
-            await client(conn, fetcher).search("forex", "us")
-    assert conn.execute("SELECT COUNT(*) FROM http_cache").fetchone()[0] == 0
+            await client(store, fetcher).search("forex", "us")
+    assert cache.default_cache.stats() == {}

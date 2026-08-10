@@ -38,13 +38,12 @@ from __future__ import annotations
 
 import logging
 import plistlib
-import sqlite3
 from dataclasses import dataclass, field
 
-from .. import cache
+from ..cache import Cache, default_cache, hints_key
 from ..config import HINTS_URL, Settings
 from ..config import settings as default_settings
-from ..db import utcnow
+from ..files import utcnow
 from ..http import Fetcher
 
 logger = logging.getLogger(__name__)
@@ -233,11 +232,11 @@ class HintsClient:
     def __init__(
         self,
         fetcher: Fetcher,
-        conn: sqlite3.Connection,
+        cache_store: Cache | None = None,
         config: Settings | None = None,
     ) -> None:
         self.fetcher = fetcher
-        self.conn = conn
+        self.cache = cache_store if cache_store is not None else default_cache
         self.settings = config or default_settings
 
     async def suggest(
@@ -250,10 +249,10 @@ class HintsClient:
         """
         country = country.lower()
         header = storefront_header(country)  # raises before any network use
-        key = cache.hints_key(prefix, country)
+        key = hints_key(prefix, country)
 
         if not force:
-            cached = cache.get(self.conn, key, self.settings.hints_ttl_days)
+            cached = self.cache.get(key, self.settings.hints_ttl_days)
             if cached is not None:
                 logger.debug("hints cache hit for %r (%s)", prefix, country)
                 return HintList(
@@ -271,7 +270,7 @@ class HintsClient:
         )
         # Parse before caching so a malformed body is never stored as if good.
         terms = parse_hints(body)
-        cache.put(self.conn, key, CACHE_KIND, body)
+        self.cache.put(key, CACHE_KIND, body)
         logger.info(
             "fetched hints for %r (%s): %d suggestions", prefix, country, len(terms)
         )

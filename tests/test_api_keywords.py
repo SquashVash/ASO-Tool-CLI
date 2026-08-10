@@ -7,38 +7,33 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
-from aso import db, repository as repo
+from aso import calibration, store as store_module
 from aso.api.app import create_app
 
-from .test_repository import days_ago
+from .conftest import days_ago
 
 
 @pytest.fixture
 def client():
-    db.init_db()
     with TestClient(create_app()) as test_client:
         yield test_client
 
 
 def seed(keyword="forex", country="us", tags="lcp", opportunity=36.0):
-    with db.session() as conn:
-        repo.add_keyword(conn, keyword, country, tags)
-        row = repo.require_keyword(conn, keyword, country)
-        repo.write_snapshot(
-            conn,
-            repo.SnapshotWrite(
-                keyword_id=row["id"],
-                captured_at=days_ago(0),
-                search_score=60.0,
-                competition_score=40.0,
-                opportunity_score=opportunity,
-                comp_rating_count=50.0,
-                comp_app_power=80.0,
-                search_prefix_depth=3,
-                search_hint_rank=2,
-            ),
+    with store_module.session() as store:
+        store.add_keyword(keyword, country, tags)
+        row = store.require_keyword(keyword, country)
+        store.write_scores(
+            row["id"],
+            captured_at=days_ago(0),
+            search_score=60.0,
+            competition_score=40.0,
+            opportunity_score=opportunity,
+            comp_rating_count=50.0,
+            comp_app_power=80.0,
+            search_prefix_depth=3,
+            search_hint_rank=2,
         )
-        repo.write_serp(conn, row["id"], days_ago(0), [111, 222])
         return row["id"]
 
 
@@ -88,28 +83,6 @@ def test_detail_404s_for_an_unknown_id(client):
     assert client.get("/keywords/9999").status_code == 404
 
 
-def test_history_is_oldest_first(client):
-    keyword_id = seed()
-    with db.session() as conn:
-        repo.write_snapshot(
-            conn,
-            repo.SnapshotWrite(
-                keyword_id=keyword_id,
-                captured_at=days_ago(7),
-                opportunity_score=10.0,
-            ),
-        )
-    body = client.get(f"/keywords/{keyword_id}/history").json()
-    assert [row["opportunity_score"] for row in body] == [10.0, 36.0]
-
-
-def test_serp_returns_the_latest_ranking(client):
-    keyword_id = seed()
-    body = client.get(f"/keywords/{keyword_id}/serp").json()
-    assert [row["rank"] for row in body] == [1, 2]
-    assert [row["track_id"] for row in body] == [111, 222]
-
-
 @respx.mock(assert_all_called=False)
 def test_read_endpoints_never_touch_the_network(respx_mock, client):
     """The same discipline test_dashboard.py enforces on the dashboard.
@@ -125,8 +98,8 @@ def test_read_endpoints_never_touch_the_network(respx_mock, client):
         "/health",
         "/keywords",
         f"/keywords/{keyword_id}",
-        f"/keywords/{keyword_id}/history",
-        f"/keywords/{keyword_id}/serp",
+        "/tags",
+        "/countries",
     ):
         assert client.get(path).status_code == 200
     assert not blocked.called

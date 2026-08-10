@@ -1,79 +1,75 @@
-"""Ad-hoc lookup: the path behind the dashboard's Find screen.
+"""Ad-hoc lookup: score a keyword without tracking it.
 
 The promise being tested is narrow and load-bearing: scoring a keyword this way
-must leave the keyword list, the snapshot history and the SERP tables exactly
-as it found them. A lookup that quietly tracked things would put rows in the
-trend history that no `aso refresh` produced.
+must leave the keyword list exactly as it found it. A lookup that quietly
+tracked things would put scores in the list that no `aso refresh` produced.
 """
 
 from __future__ import annotations
 
-import sqlite3
 
 import pytest
 
 from aso import lookup as lookup_module
-from aso import repository as repo
+from aso import store as store_module
 
-from .test_repository import days_ago
+from .conftest import days_ago
 
 
-def snapshot_with(conn: sqlite3.Connection, keyword: str, opportunity: float) -> int:
-    repo.add_keyword(conn, keyword, "us")
-    row = repo.require_keyword(conn, keyword, "us")
-    repo.write_snapshot(
-        conn,
-        repo.SnapshotWrite(
-            keyword_id=row["id"],
-            captured_at=days_ago(0),
-            search_score=50.0,
-            competition_score=50.0,
-            opportunity_score=opportunity,
-        ),
+def scored_keyword(store: store_module.Store, keyword: str, opportunity: float) -> int:
+    """Track `keyword` and give it scores, as one refresh would."""
+    keyword_id, _ = store.add_keyword(keyword, "us")
+    store.write_scores(
+        keyword_id,
+        captured_at=days_ago(0),
+        search_score=50.0,
+        competition_score=50.0,
+        opportunity_score=opportunity,
     )
-    return row["id"]
+    store.save()
+    return keyword_id
 
 
 # --- percentile context ----------------------------------------------------
 
 
-def test_percentile_is_none_when_nothing_is_tracked(conn: sqlite3.Connection) -> None:
+def test_percentile_is_none_when_nothing_is_tracked(store: store_module.Store) -> None:
     """A percentile against an empty set is not 0, it is unanswerable."""
-    percentile, compared = lookup_module.opportunity_percentile(conn, 40.0)
+    percentile, compared = lookup_module.opportunity_percentile(store, 40.0)
     assert percentile is None
     assert compared == 0
 
 
-def test_percentile_is_none_for_an_unscored_keyword(conn: sqlite3.Connection) -> None:
-    snapshot_with(conn, "a", 10.0)
-    assert lookup_module.opportunity_percentile(conn, None) == (None, 0)
+def test_percentile_is_none_for_an_unscored_keyword(store: store_module.Store) -> None:
+    scored_keyword(store, "a", 10.0)
+    assert lookup_module.opportunity_percentile(store, None) == (None, 0)
 
 
-def test_percentile_counts_how_many_it_beats(conn: sqlite3.Connection) -> None:
+def test_percentile_counts_how_many_it_beats(store: store_module.Store) -> None:
     for index, value in enumerate([10.0, 20.0, 30.0, 40.0]):
-        snapshot_with(conn, f"kw{index}", value)
+        scored_keyword(store, f"kw{index}", value)
 
-    percentile, compared = lookup_module.opportunity_percentile(conn, 35.0)
+    percentile, compared = lookup_module.opportunity_percentile(store, 35.0)
     assert compared == 4
     assert percentile == pytest.approx(75.0)
 
 
-def test_a_score_below_everything_is_zero_not_none(conn: sqlite3.Connection) -> None:
+def test_a_score_below_everything_is_zero_not_none(store: store_module.Store) -> None:
     """Zero is a real answer here; None means "no basis for an answer"."""
-    snapshot_with(conn, "a", 50.0)
-    percentile, compared = lookup_module.opportunity_percentile(conn, 1.0)
+    scored_keyword(store, "a", 50.0)
+    percentile, compared = lookup_module.opportunity_percentile(store, 1.0)
     assert percentile == pytest.approx(0.0)
     assert compared == 1
 
 
 def test_unscored_keywords_are_excluded_from_the_comparison(
-    conn: sqlite3.Connection,
+    store: store_module.Store,
 ) -> None:
     """A keyword that was never refreshed is not a keyword you beat."""
-    snapshot_with(conn, "scored", 10.0)
-    repo.add_keyword(conn, "never-refreshed", "us")
+    scored_keyword(store, "scored", 10.0)
+    store.add_keyword("never-refreshed", "us")
 
-    percentile, compared = lookup_module.opportunity_percentile(conn, 20.0)
+    percentile, compared = lookup_module.opportunity_percentile(store, 20.0)
     assert compared == 1
     assert percentile == pytest.approx(100.0)
 
@@ -95,13 +91,13 @@ def test_blank_country_is_rejected_without_fetching() -> None:
 # --- the write-nothing guarantee -------------------------------------------
 
 
-def test_lookup_writes_no_keyword_snapshot_or_serp(monkeypatch, tmp_path) -> None:
-    """The whole point of the Find screen: score it, store nothing.
+def test_lookup_writes_nothing(monkeypatch, tmp_path) -> None:
+    """The whole point of an ad-hoc check: score it, store nothing.
 
     `score_keyword` is stubbed so this exercises `lookup`'s own persistence
     behaviour rather than the scoring pipeline's, which has its own tests.
     """
-    from aso import db, pipeline
+    from aso import pipeline
 
     async def fake_score(keyword, country, **kwargs):
         outcome = pipeline.KeywordOutcome(
@@ -116,23 +112,19 @@ def test_lookup_writes_no_keyword_snapshot_or_serp(monkeypatch, tmp_path) -> Non
 
     monkeypatch.setattr(lookup_module.pipeline, "score_keyword", fake_score)
 
-    with db.session() as conn:
-        db.migrate(conn)
-
     result = lookup_module.lookup("untracked term", "us")
 
     assert result.tracked is False
     assert result.outcome.opportunity_score == pytest.approx(36.0)
 
-    with db.session() as conn:
-        assert repo.get_keyword(conn, "untracked term", "us") is None
-        assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM serps").fetchone()[0] == 0
+    with store_module.session() as store:
+        assert store.get_keyword("untracked term", "us") is None
+        assert store.records == []
 
 
 def test_lookup_reports_an_already_tracked_keyword(monkeypatch) -> None:
     """So the UI can offer "track this" only when it would do something."""
-    from aso import db, pipeline
+    from aso import pipeline
 
     async def fake_score(keyword, country, **kwargs):
         outcome = pipeline.KeywordOutcome(
@@ -145,15 +137,14 @@ def test_lookup_reports_an_already_tracked_keyword(monkeypatch) -> None:
 
     monkeypatch.setattr(lookup_module.pipeline, "score_keyword", fake_score)
 
-    with db.session() as conn:
-        db.migrate(conn)
-        repo.add_keyword(conn, "forex", "us")
+    with store_module.session() as store:
+        store.add_keyword("forex", "us")
 
     assert lookup_module.lookup("forex", "us").tracked is True
 
 
 def test_lookup_normalizes_country_case(monkeypatch) -> None:
-    from aso import db, pipeline
+    from aso import pipeline
 
     seen: dict[str, str] = {}
 
@@ -167,9 +158,6 @@ def test_lookup_normalizes_country_case(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(lookup_module.pipeline, "score_keyword", fake_score)
-    with db.session() as conn:
-        db.migrate(conn)
-
     lookup_module.lookup("forex", "US")
     assert seen["country"] == "us"
 
@@ -177,7 +165,7 @@ def test_lookup_normalizes_country_case(monkeypatch) -> None:
 async def test_lookup_async_uses_a_caller_supplied_fetcher(monkeypatch) -> None:
     """The API owns one Fetcher for its process. A lookup that built its own
     would draw from a second token bucket against the same per-IP limit."""
-    from aso import db, pipeline
+    from aso import pipeline
 
     from .test_http import fast_fetcher
 
@@ -194,9 +182,6 @@ async def test_lookup_async_uses_a_caller_supplied_fetcher(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(lookup_module.pipeline, "score_keyword", fake_score)
-    with db.session() as conn:
-        db.migrate(conn)
-
     async with fast_fetcher() as fetcher:
         await lookup_module.lookup_async("forex", "us", fetcher=fetcher)
 
@@ -207,7 +192,7 @@ async def test_lookup_async_uses_a_caller_supplied_fetcher(monkeypatch) -> None:
 async def test_lookup_async_passes_the_chart_index_through(monkeypatch) -> None:
     """Without it `comp_app_power` is None and `combine()` renormalizes over
     the rest — and that component carries 0.625 of the fitted weight."""
-    from aso import db, pipeline
+    from aso import pipeline
     from aso.clients.charts import ChartIndex
 
     from .test_http import fast_fetcher
@@ -224,9 +209,6 @@ async def test_lookup_async_passes_the_chart_index_through(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(lookup_module.pipeline, "score_keyword", fake_score)
-    with db.session() as conn:
-        db.migrate(conn)
-
     index = ChartIndex(country="us", ranks={111: 3})
     async with fast_fetcher() as fetcher:
         await lookup_module.lookup_async("forex", "us", fetcher=fetcher, charts=index)

@@ -22,10 +22,10 @@ load_dotenv(PROJECT_ROOT / ".env")
 # Competition weights
 # ---------------------------------------------------------------------------
 # Six normalized 0-100 components combined as a weighted mean. Tune these
-# freely: every component is stored on the snapshot row, so changing a weight
-# lets you re-score history without re-fetching anything.
+# freely: every component is stored beside the finals on each keyword's record,
+# so changing a weight lets `aso rescore` re-score without re-fetching anything.
 #
-# Keys must match the `comp_*` column names on `snapshots`.
+# Keys must match the `comp_*` field names in `store.SCORE_FIELDS`.
 #
 # FITTED, not chosen. Re-derived 2026-08-09 by `aso calibrate-competition`
 # against 207 keywords carrying AppFigures Competitiveness ratings, selected by
@@ -87,9 +87,9 @@ load_dotenv(PROJECT_ROOT / ".env")
 # re-fit, and now rests on a measured reason rather than a broken range.
 #
 # Weight 0 means `competition.combine` skips the component and renormalizes
-# over the rest, while `pipeline` and `dashboard` still treat every key here as
-# a snapshot column — which all eight are. The zeroed components stay measured
-# and stored so that a later, broader sample can overturn this in turn.
+# over the rest, while `pipeline` still treats every key here as a stored
+# score field — which all eight are. The zeroed components stay measured and
+# stored so that a later, broader sample can overturn this in turn.
 #
 # WHAT THIS FIT DOES NOT PROVE
 # ----------------------------
@@ -841,7 +841,10 @@ class ASASettings:
 
 @dataclass(frozen=True)
 class Settings:
-    db_path: Path = PROJECT_ROOT / "aso.db"
+    # Where the JSON data files live: the keyword list, the fitted bridges, and
+    # the measured observations the fits read. Replaced the 492MB SQLite file,
+    # of which 459MB was cached HTTP bodies that scoring never read.
+    data_dir: Path = PROJECT_ROOT / "data"
     default_country: str = "us"
 
     # The API binds loopback because this tool has no authentication. Other
@@ -895,11 +898,11 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        db_path = _env_path("ASO_DB_PATH") or (PROJECT_ROOT / "aso.db")
-        if not db_path.is_absolute():
-            db_path = PROJECT_ROOT / db_path
+        data_dir = _env_path("ASO_DATA_DIR") or (PROJECT_ROOT / "data")
+        if not data_dir.is_absolute():
+            data_dir = PROJECT_ROOT / data_dir
         return cls(
-            db_path=db_path,
+            data_dir=data_dir,
             default_country=_env_str("ASO_DEFAULT_COUNTRY", "us").lower(),
             api_host=_env_str("ASO_API_HOST", "127.0.0.1"),
             api_port=_env_int("ASO_API_PORT", 8081),

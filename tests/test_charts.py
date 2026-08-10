@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 
 import httpx
 import pytest
@@ -103,12 +102,12 @@ def test_an_index_that_loaded_but_found_nothing_is_still_truthy() -> None:
 
 
 @respx.mock
-async def test_index_pulls_every_feed_and_genre(conn: sqlite3.Connection) -> None:
+async def test_index_pulls_every_feed_and_genre(store: store_module.Store) -> None:
     route = respx.get(url__regex=URL_PATTERN).mock(
         return_value=httpx.Response(200, text=CHARTS_BODY)
     )
     async with fast_fetcher() as fetcher:
-        index = await ChartsClient(fetcher, conn).index("us")
+        index = await ChartsClient(fetcher).index("us")
 
     assert route.call_count == FEED_COUNT
     assert index.charts_loaded == FEED_COUNT
@@ -117,12 +116,12 @@ async def test_index_pulls_every_feed_and_genre(conn: sqlite3.Connection) -> Non
 
 
 @respx.mock
-async def test_the_second_call_is_served_from_cache(conn: sqlite3.Connection) -> None:
+async def test_the_second_call_is_served_from_cache(store: store_module.Store) -> None:
     route = respx.get(url__regex=URL_PATTERN).mock(
         return_value=httpx.Response(200, text=CHARTS_BODY)
     )
     async with fast_fetcher() as fetcher:
-        client = ChartsClient(fetcher, conn)
+        client = ChartsClient(fetcher)
         await client.index("us")
         cold = route.call_count
         await client.index("us")
@@ -130,7 +129,7 @@ async def test_the_second_call_is_served_from_cache(conn: sqlite3.Connection) ->
 
 
 @respx.mock
-async def test_one_failing_feed_costs_only_that_feed(conn: sqlite3.Connection) -> None:
+async def test_one_failing_feed_costs_only_that_feed(store: store_module.Store) -> None:
     """Some genres have no chart, and the feed drops URLs without notice."""
     calls = {"n": 0}
 
@@ -142,7 +141,7 @@ async def test_one_failing_feed_costs_only_that_feed(conn: sqlite3.Connection) -
 
     respx.get(url__regex=URL_PATTERN).mock(side_effect=responder)
     async with fast_fetcher(retry_attempts=1) as fetcher:
-        index = await ChartsClient(fetcher, conn).index("us")
+        index = await ChartsClient(fetcher).index("us")
 
     assert 0 < index.charts_loaded < FEED_COUNT
     assert index, "a partial index is still an index"
@@ -151,36 +150,36 @@ async def test_one_failing_feed_costs_only_that_feed(conn: sqlite3.Connection) -
 
 @respx.mock
 async def test_total_failure_yields_an_unknown_index_not_an_empty_one(
-    conn: sqlite3.Connection,
+    store: store_module.Store,
 ) -> None:
     respx.get(url__regex=URL_PATTERN).mock(return_value=httpx.Response(500))
     async with fast_fetcher(retry_attempts=1) as fetcher:
-        index = await ChartsClient(fetcher, conn).index("us")
+        index = await ChartsClient(fetcher).index("us")
 
     assert index.charts_loaded == 0
     assert not index, "must renormalize away, not score the storefront as easy"
 
 
 @respx.mock
-async def test_a_failed_feed_is_never_cached(conn: sqlite3.Connection) -> None:
+async def test_a_failed_feed_is_never_cached(store: store_module.Store) -> None:
     """Caching a 500 would poison the index for a whole day."""
     respx.get(url__regex=URL_PATTERN).mock(return_value=httpx.Response(500))
     async with fast_fetcher(retry_attempts=1) as fetcher:
-        await ChartsClient(fetcher, conn).index("us")
+        await ChartsClient(fetcher).index("us")
 
     key = cache.charts_key("us", config.CHART_FEEDS[0], next(iter(config.CHART_GENRES)))
-    assert cache.get(conn, key, config.CHARTS_TTL_DAYS) is None
+    assert cache.default_cache.get(key, config.CHARTS_TTL_DAYS) is None
 
 
 @respx.mock
 async def test_country_is_normalized_into_the_url_and_the_key(
-    conn: sqlite3.Connection,
+    store: store_module.Store,
 ) -> None:
     route = respx.get(url__regex=URL_PATTERN).mock(
         return_value=httpx.Response(200, text=CHARTS_BODY)
     )
     async with fast_fetcher() as fetcher:
-        index = await ChartsClient(fetcher, conn).index("GB")
+        index = await ChartsClient(fetcher).index("GB")
 
     assert index.country == "gb"
     assert all("/gb/rss/" in str(call.request.url) for call in route.calls)

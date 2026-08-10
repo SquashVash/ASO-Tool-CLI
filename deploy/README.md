@@ -1,8 +1,9 @@
 # Deploying on Ubuntu
 
 Target: a 4GB / 2 vCPU box (`ubuntu-4gb-nbg1-2`). One uvicorn worker is ~100MB
-and SQLite's page cache is modest, so memory is not the constraint. **Disk is**
-— `aso.db` is around 500MB and grows with every refresh, plus its WAL.
+and the data files are under a megabyte, so neither memory nor disk is a
+constraint. The response cache is in-process and bounded by its TTLs, so the
+footprint stays flat across a long-running server.
 
 ## Install
 
@@ -25,17 +26,20 @@ sudo install -o aso -g aso -m 600 /tmp/asa-private-key.pem /opt/aso/
 sudo rm /tmp/.env /tmp/asa-private-key.pem
 ```
 
-Copy the database up rather than starting cold — it holds the fitted
-calibration and all your history:
+`data/` is in git — the fitted bridges, the measured observations and the
+frozen calibration corpus all ship with the checkout, so a fresh clone scores
+identically to your laptop with no copying.
+
+The one file worth copying is your own keyword list, which starts empty:
 
 ```bash
-scp aso.db root@<host>:/tmp/aso.db
-sudo install -o aso -g aso -m 644 /tmp/aso.db /opt/aso/aso.db && sudo rm /tmp/aso.db
+scp data/keywords.json root@<host>:/tmp/keywords.json
+sudo install -o aso -g aso -m 644 /tmp/keywords.json /opt/aso/data/keywords.json
+sudo rm /tmp/keywords.json
 ```
 
-Stop the API before replacing `aso.db`, and copy the `-wal` and `-shm` files
-alongside it if they exist — or checkpoint first with
-`sqlite3 aso.db 'PRAGMA wal_checkpoint(TRUNCATE);'`.
+Stop the API before replacing it. A refresh writes the whole file at once, so
+overwriting it under a running job would lose that job's results.
 
 ## Units
 

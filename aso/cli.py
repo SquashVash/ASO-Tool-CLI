@@ -1,16 +1,14 @@
 """Typer entrypoint.
 
-    aso init
     aso check "meditation timer"          # score it without tracking it
     aso add "candlestick patterns" --country us --tag lcp
     aso import keywords.csv
     aso refresh --tag lcp --country us
     aso list --sort opportunity --limit 30
     aso show "candlestick patterns"
-    aso track --track-id 627114159
     aso export --format csv
 
-Presentation only: no scoring or SQL lives here.
+Presentation only: no scoring and no data access lives here.
 """
 
 from __future__ import annotations
@@ -30,7 +28,7 @@ from rich.logging import RichHandler
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
-from . import __version__, importers, pipeline, repository
+from . import __version__, calibration, importers, pipeline
 from .clients import apple_popularity, asa
 from .clients.charts import ChartsClient
 from .clients.hints import HintsClient
@@ -44,9 +42,8 @@ from .config import (
     SEARCH_EXTENSIONS_WEIGHT,
     settings,
 )
-from .db import init_db, session, transaction
 from .http import Fetcher
-from .repository import UnknownKeyword
+from .store import UnknownKeyword, session
 from .scoring import bridge as bridge_scoring
 from .scoring import competition
 from .scoring import search as search_scoring
@@ -126,20 +123,18 @@ def opportunity_style(value: float | None) -> str:
 
 
 @app.command()
-def init() -> None:
-    """Create the database and apply any pending migrations."""
-    applied = init_db()
-    if applied:
-        console.print(f"[green]Applied migrations:[/green] {', '.join(map(str, applied))}")
-    else:
-        console.print("[dim]Schema already up to date.[/dim]")
-    console.print(f"[dim]Database:[/dim] {settings.db_path}")
-
-
-@app.command()
 def version() -> None:
-    """Print the tool version."""
+    """Print the version, and what data is loaded."""
     console.print(f"aso {__version__}")
+    console.print(f"[dim]data:[/dim] {settings.data_dir}")
+    demand = calibration.demand_observations()
+    fitted = calibration.bridges()
+    with session() as store:
+        tracked = len(store.records)
+    console.print(
+        f"[dim]{tracked} keyword(s) tracked · {len(demand)} demand observation(s) · "
+        f"{len(calibration.corpus())} corpus row(s) · {len(fitted)} fitted bridge(s)[/dim]"
+    )
 
 
 @app.command()
@@ -174,14 +169,13 @@ def add(
     tag: list[str] = typer.Option([], "--tag", "-t", help="Repeatable."),
 ) -> None:
     """Track a keyword in a storefront."""
-    with session() as conn:
-        init_db()
+    with session() as store:
         try:
-            keyword_id, created = repository.add_keyword(conn, keyword, country, tag)
+            keyword_id, created = store.add_keyword(keyword, country, tag)
         except ValueError as exc:
             err_console.print(f"[red]{exc}[/red]")
             raise typer.Exit(1)
-        row = repository.require_keyword(conn, keyword, country)
+        row = store.require_keyword(keyword, country)
 
     verb = "Added" if created else "Already tracked (tags merged)"
     tags = row["tags"] or "[dim]none[/dim]"
@@ -219,8 +213,7 @@ def import_keywords(
             )
             raise typer.Exit(1)
 
-        with session() as conn:
-            init_db()
+        with session() as store:
             for line_number, raw in enumerate(reader, start=2):
                 row = {(k or "").strip().lower(): (v or "").strip() for k, v in raw.items()}
                 keyword = row.get("keyword", "")
@@ -231,8 +224,8 @@ def import_keywords(
                     part for part in row.get("tags", "").replace(";", ",").split(",") if part
                 ]
                 try:
-                    _, created = repository.add_keyword(
-                        conn, keyword, row.get("country") or default_country, tags
+                    _, created = store.add_keyword(
+                        keyword, row.get("country") or default_country, tags
                     )
                 except ValueError as exc:
                     skipped.append(f"line {line_number}: {exc}")
@@ -261,17 +254,16 @@ def refresh(
     cached on disk, so restarting only re-does the keyword that was in flight.
     """
     setup_logging(verbose)
-    with session() as conn:
-        init_db()
+    with session() as store:
         if keyword:
             try:
-                rows = [repository.require_keyword(conn, keyword, country or settings.default_country)]
+                rows = [store.require_keyword(keyword, country or settings.default_country)]
             except UnknownKeyword as exc:
                 err_console.print(f"[red]{exc}[/red]")
                 raise typer.Exit(1)
         else:
-            rows = repository.list_keywords(
-                conn, tag=tag, country=country, active_only=not include_inactive
+            rows = store.list_keywords(
+                tag=tag, country=country, active_only=not include_inactive
             )
         if limit is not None:
             rows = rows[:limit]
@@ -310,7 +302,7 @@ def refresh(
                     )
 
                 report = asyncio.run(
-                    pipeline.refresh(conn, rows, force=force, on_progress=advance)
+                    pipeline.refresh(store, rows, force=force, on_progress=advance)
                 )
         except KeyboardInterrupt:
             console.print(
@@ -345,9 +337,8 @@ def check(
     """Score a keyword without tracking it. Writes nothing to your keyword list.
 
     For answering "is this term worth tracking?" before committing to it. Runs
-    exactly the same scoring code as `refresh`, but stores no keyword, no
-    snapshot and no SERP — so it leaves no trend history and cannot be compared
-    over time. Use `aso add` for anything you want to watch.
+    exactly the same scoring code as `refresh`, but records nothing. Use
+    `aso add` for anything you want to keep a score for.
 
     It does build the chart index, which costs up to 48 requests the first time
     it runs in a storefront on a given day and nothing thereafter. That is a
@@ -365,28 +356,26 @@ def check(
 
     async def main():
         async with Fetcher(settings) as fetcher:
-            with session() as conn:
-                init_db()
-                itunes = ITunesClient(fetcher, conn, settings)
-                hints = HintsClient(fetcher, conn, settings)
-                charts_client = ChartsClient(fetcher, conn, settings)
-                # `force` is not passed on: it means "refetch this keyword",
-                # and the index is a property of the storefront and the day.
-                charts = await charts_client.index(country.lower())
-                scored = await pipeline.score_keyword(
-                    keyword,
-                    country.lower(),
-                    itunes=itunes,
-                    hints=hints,
-                    force=force,
-                    charts=charts,
-                )
-                # Report the same numbers a tracked keyword would, on both
-                # axes. See `pipeline.blend_outcome` and `bridge_outcome` —
-                # `score_keyword` reads no table, so neither the measured
-                # demand value nor the fitted competition scale reaches it.
-                pipeline.bridge_outcome(conn, scored.outcome)
-                pipeline.blend_outcome(conn, scored.outcome)
+            itunes = ITunesClient(fetcher, config=settings)
+            hints = HintsClient(fetcher, config=settings)
+            charts_client = ChartsClient(fetcher, config=settings)
+            # `force` is not passed on: it means "refetch this keyword", and
+            # the index is a property of the storefront and the day.
+            charts = await charts_client.index(country.lower())
+            scored = await pipeline.score_keyword(
+                keyword,
+                country.lower(),
+                itunes=itunes,
+                hints=hints,
+                force=force,
+                charts=charts,
+            )
+            # Report the same numbers a tracked keyword would, on both axes.
+            # See `pipeline.blend_outcome` and `bridge_outcome` —
+            # `score_keyword` reads no stored data, so neither the measured
+            # demand value nor the fitted competition scale reaches it.
+            pipeline.bridge_outcome(scored.outcome)
+            pipeline.blend_outcome(scored.outcome)
             return scored, fetcher.requests_made
 
     scored, requests = asyncio.run(main())
@@ -458,8 +447,8 @@ def check(
         err_console.print(f"[yellow]{outcome.status}[/yellow]: {outcome.error}")
 
     console.print(
-        f"[dim]{requests} request(s). Not tracked — no snapshot written. "
-        f"`aso add {keyword!r} --country {country.lower()}` to start a history.[/dim]"
+        f"[dim]{requests} request(s). Not tracked — nothing written. "
+        f"`aso add {keyword!r} --country {country.lower()}` to keep it.[/dim]"
     )
 
 
@@ -469,16 +458,15 @@ def rescore(
 ) -> None:
     """Recompute every stored score from its saved components. No network access.
 
-    Run this after changing COMPETITION_WEIGHTS or the search mapping, so trend
-    history is scored consistently instead of splicing two schemes together.
+    Run this after changing COMPETITION_WEIGHTS or the search mapping, so every
+    tracked keyword is scored under one scheme instead of a mix.
     """
     setup_logging(verbose)
-    with session() as conn:
-        init_db()
-        report = pipeline.rescore(conn)
+    with session() as store:
+        report = pipeline.rescore(store)
 
     if report.total == 0:
-        console.print("[yellow]No snapshots to re-score.[/yellow]")
+        console.print("[yellow]No scored keywords to re-score.[/yellow]")
         return
 
     console.print(
@@ -501,11 +489,10 @@ def list_keywords(
     include_inactive: bool = typer.Option(False, "--include-inactive"),
 ) -> None:
     """Show tracked keywords with their latest scores."""
-    with session() as conn:
-        init_db()
+    with session() as store:
         try:
-            rows = repository.latest_scores(
-                conn, tag=tag, country=country, sort=sort, limit=limit,
+            rows = store.latest_scores(
+                tag=tag, country=country, sort=sort, limit=limit,
                 active_only=not include_inactive,
             )
         except ValueError as exc:
@@ -554,28 +541,24 @@ def list_keywords(
 def show(
     keyword: str = typer.Argument(...),
     country: str = typer.Option(settings.default_country, "--country", "-c"),
-    history: int = typer.Option(10, "--history", "-h", help="Snapshots to chart."),
 ) -> None:
-    """Detail for one keyword: components, trend, and the current top 10."""
-    with session() as conn:
-        init_db()
+    """Detail for one keyword: its scores and every component behind them."""
+    with session() as store:
         try:
-            row = repository.require_keyword(conn, keyword, country)
+            row = store.require_keyword(keyword, country)
         except UnknownKeyword as exc:
             err_console.print(f"[red]{exc}[/red]")
             raise typer.Exit(1)
-        latest = repository.latest_snapshot(conn, row["id"])
-        trend = repository.snapshot_history(conn, row["id"], limit=history)
-        serp = repository.latest_serp(conn, row["id"], limit=10)
 
     console.print(f"\n[bold]{row['keyword']}[/bold] ({row['country']})")
     console.print(f"[dim]tags: {row['tags'] or 'none'} · tracking since {row['created_at'][:10]}[/dim]\n")
 
-    if latest is None:
+    if not row.get("captured_at"):
         console.print("[yellow]Never refreshed.[/yellow]")
         console.print(f"[dim]Run `aso refresh -k \"{row['keyword']}\" -c {row['country']}`.[/dim]")
         return
 
+    latest = row
     if latest["fetch_failed"]:
         console.print(f"[red]Last refresh had errors:[/red] {latest['fetch_error']}\n")
 
@@ -625,71 +608,15 @@ def show(
         + f" (keyword is {len(row['keyword'])} chars)[/dim]\n"
     )
 
-    if len(trend) > 1:
-        chart = Table("captured", "search", "comp", "opp", title="trend")
-        for snap in trend:
-            chart.add_row(
-                snap["captured_at"][:10],
-                fmt(snap["search_score"]),
-                fmt(snap["competition_score"]),
-                fmt(snap["opportunity_score"]),
-            )
-        console.print(chart)
-    else:
-        console.print("[dim]Only one snapshot so far — no trend yet.[/dim]\n")
-
-    if serp:
-        results = Table(
-            "#", "app", "seller", "ratings", "stars",
-            title=f"top 10 — iTunes Search order (NOT App Store rank) · {serp[0]['captured_at'][:10]}",
+    console.print(
+        f"[dim]scored {latest['captured_at'][:10]}"
+        + (
+            ""
+            if latest.get("search_source") is None
+            else f" · demand from {latest['search_source']}"
         )
-        for entry in serp:
-            results.add_row(
-                str(entry["rank"]),
-                entry["track_name"] or f"[dim]#{entry['track_id']}[/dim]",
-                entry["seller_name"] or "[dim]—[/dim]",
-                fmt_int(entry["user_rating_count"]),
-                fmt(entry["average_user_rating"], 2),
-            )
-        console.print(results)
-
-
-@app.command()
-def track(
-    track_id: int = typer.Option(..., "--track-id", help="Your app's iTunes track id."),
-    country: Optional[str] = typer.Option(None, "--country", "-c"),
-) -> None:
-    """Where one of your apps sits across every tracked keyword."""
-    with session() as conn:
-        init_db()
-        rows = repository.track_positions(conn, track_id, country=country)
-
-    if not rows:
-        console.print(f"[yellow]App {track_id} doesn't appear in any stored ranking.[/yellow]")
-        console.print("[dim]Run `aso refresh` first, or check the track id.[/dim]")
-        return
-
-    table = Table("keyword", "cc", "rank", "was", "move", title=f"app {track_id}")
-    for row in rows:
-        current, previous = row["rank"], row["previous_rank"]
-        if current is None:
-            move = "[red]dropped out[/red]"
-        elif previous is None:
-            move = "[dim]new[/dim]"
-        elif previous > current:
-            move = f"[green]▲ {previous - current}[/green]"
-        elif previous < current:
-            move = f"[red]▼ {current - previous}[/red]"
-        else:
-            move = "[dim]—[/dim]"
-        table.add_row(
-            row["keyword"], row["country"],
-            "[dim]—[/dim]" if current is None else str(current),
-            "[dim]—[/dim]" if previous is None else str(previous),
-            move,
-        )
-    console.print(table)
-    console.print("[dim]Position in the iTunes Search result set, not App Store rank.[/dim]")
+        + ". `aso check` re-scores it live against Apple.[/dim]"
+    )
 
 
 @app.command()
@@ -705,10 +632,9 @@ def export(
         err_console.print(f"[red]Unknown format {format!r}. Use csv or json.[/red]")
         raise typer.Exit(1)
 
-    with session() as conn:
-        init_db()
+    with session() as store:
         try:
-            rows = repository.latest_scores(conn, tag=tag, country=country, sort=sort)
+            rows = store.latest_scores(tag=tag, country=country, sort=sort)
         except ValueError as exc:
             err_console.print(f"[red]{exc}[/red]")
             raise typer.Exit(1)
@@ -861,16 +787,15 @@ def asa_pull(
         raise typer.Exit(1)
     start, end = asa.default_window(lookback_days=days)
 
-    async def main(conn):
+    async def main():
         async with asa_fetcher() as fetcher:
             return await pipeline.pull_asa(
-                conn, start=start, end=end, config=settings, fetcher=fetcher
+                start=start, end=end, config=settings, fetcher=fetcher
             )
 
-    with session() as conn:
-        init_db()
+    with session() as store:
         try:
-            report = asyncio.run(main(conn))
+            report = asyncio.run(main())
         except asa.ASAError as exc:
             handle_asa_errors(exc)
 
@@ -924,10 +849,9 @@ def import_demand(
         raise typer.Exit(1)
 
     tracked = 0
-    with session() as conn:
-        init_db()
-        with transaction(conn):
-            written = repository.write_demand_observations(conn, result.rows)
+    with session() as store:
+        written = calibration.write_demand_observations(result.rows)
+        if True:
             if track or stratify:
                 to_track = (
                     importers.stratified_sample(result.rows, stratify)
@@ -935,7 +859,7 @@ def import_demand(
                     else result.rows
                 )
                 for row in to_track:
-                    _, created = repository.add_keyword(conn, row.keyword, row.country)
+                    _, created = store.add_keyword(row.keyword, row.country)
                     tracked += created
 
     console.print(
@@ -996,13 +920,12 @@ def import_competition(
         raise typer.Exit(1)
 
     tracked = 0
-    with session() as conn:
-        init_db()
-        with transaction(conn):
-            written = repository.write_competition_observations(conn, result.rows)
+    with session() as store:
+        written = calibration.write_competition_observations(result.rows)
+        if True:
             if track:
                 for row in result.rows:
-                    _, created = repository.add_keyword(conn, row.keyword, row.country)
+                    _, created = store.add_keyword(row.keyword, row.country)
                     tracked += created
 
     console.print(
@@ -1037,10 +960,9 @@ def calibrate_competition(
     After pasting, run `aso rescore` to move history onto the new weights.
     """
     setup_logging(verbose)
-    with session() as conn:
-        init_db()
+    with session() as store:
         samples = [
-            dict(row) for row in repository.competition_calibration_samples(conn, source)
+            dict(row) for row in calibration.competition_samples(source, store)
         ]
 
     if not samples:
@@ -1160,9 +1082,8 @@ def calibrate(
     pasting, run `aso rescore` to move history onto the new mapping.
     """
     setup_logging(verbose)
-    with session() as conn:
-        init_db()
-        available = repository.demand_sources(conn)
+    with session() as store:
+        available = calibration.demand_sources()
         if not available:
             err_console.print(
                 "[red]No measured demand to calibrate against.[/red]\n"
@@ -1175,14 +1096,14 @@ def calibrate(
         # rows and is the weakest of the three — its popularity is derived from
         # the very Apple indicator `apple` reports directly, so preferring it
         # on volume would fit the copy in preference to the original.
-        chosen = source or repository.preferred_demand_source(conn) or available[0]["source"]
+        chosen = source or calibration.preferred_demand_source() or available[0]["source"]
         if chosen not in {row["source"] for row in available}:
             err_console.print(
                 f"[red]No demand stored for source {chosen!r}.[/red] "
                 f"Available: {', '.join(r['source'] for r in available)}"
             )
             raise typer.Exit(1)
-        samples = pipeline.calibration_from_db(conn, chosen)
+        samples = pipeline.calibration_for(chosen, store)
 
     if source is None and len(available) > 1:
         console.print(
@@ -1300,9 +1221,8 @@ def fit_bridge(
     after Spearman here would print the same number twice and look like proof.
     """
     setup_logging(verbose)
-    with session() as conn:
-        init_db()
-        pairs = repository.bridge_pairs(conn, country=country, source=source)
+    with session() as store:
+        pairs = calibration.bridge_pairs(country=country, source=source, store=store)
         if not pairs:
             err_console.print(
                 f"[yellow]No keyword in '{country}' has both a proxy score and a "
@@ -1339,9 +1259,8 @@ def fit_bridge(
             )
             return
 
-        with transaction(conn):
-            repository.write_bridge(
-                conn,
+        if True:
+            calibration.write_bridge(
                 country=country,
                 source=source,
                 knots_json=fitted.to_json(),
@@ -1386,10 +1305,9 @@ def fit_competition_bridge(
     into the knots and hides it behind a plausible number.
     """
     setup_logging(verbose)
-    with session() as conn:
-        init_db()
+    with session() as store:
         samples = [
-            dict(row) for row in repository.competition_calibration_samples(conn, source)
+            dict(row) for row in calibration.competition_samples(source, store)
         ]
         samples = [s for s in samples if s.get("country", country) == country]
 
@@ -1450,9 +1368,8 @@ def fit_competition_bridge(
             )
             return
 
-        with transaction(conn):
-            repository.write_bridge(
-                conn,
+        if True:
+            calibration.write_bridge(
                 country=country,
                 source=source,
                 knots_json=fitted.to_json(),
@@ -1479,9 +1396,8 @@ def evaluate(
     after touching the scoring constants, the components, or the bridge.
     """
     setup_logging(verbose)
-    with session() as conn:
-        init_db()
-        chosen = source or repository.preferred_demand_source(conn)
+    with session() as store:
+        chosen = source or calibration.preferred_demand_source()
         if chosen is None:
             err_console.print(
                 "[yellow]No demand source has any scored keyword to grade "
@@ -1491,7 +1407,7 @@ def evaluate(
             )
             raise typer.Exit(1)
 
-        pairs = repository.bridge_pairs(conn, country=country, source=chosen)
+        pairs = calibration.bridge_pairs(country=country, source=chosen, store=store)
         if len(pairs) < 2:
             err_console.print(
                 f"[yellow]Only {len(pairs)} keyword(s) in '{country}' carry both "
@@ -1503,20 +1419,16 @@ def evaluate(
         measured = [row["measured"] for row in pairs]
         rho = search_scoring.spearman(proxy, measured)
 
-        coverage = conn.execute(
-            """
-            SELECT COALESCE(s.search_source, 'proxy') AS src, COUNT(*) AS n
-            FROM keywords k
-            JOIN snapshots s ON s.id = (
-                SELECT id FROM snapshots
-                WHERE keyword_id = k.id
-                ORDER BY captured_at DESC, id DESC LIMIT 1
-            )
-            WHERE k.country = ? AND k.active = 1
-            GROUP BY src
-            """,
-            (country.lower(),),
-        ).fetchall()
+        # Which ruler each scored keyword in this storefront ended up on.
+        # Counted over the same set the fit trains on — the frozen corpus plus
+        # anything tracked — so "227 scored by apple" means the same thing here
+        # as the overlap count above.
+        coverage: dict[str, int] = {}
+        for record in calibration.scored_keywords(store).values():
+            if record["country"] != country.lower():
+                continue
+            src = record.get("search_source") or "proxy"
+            coverage[src] = coverage.get(src, 0) + 1
 
         table = Table(title=f"Demand proxy vs '{chosen}' ({country})")
         table.add_column("metric")
@@ -1524,19 +1436,18 @@ def evaluate(
         table.add_row("overlapping keywords", str(len(pairs)))
         table.add_row("Spearman (proxy vs measured)", f"{rho:+.3f}")
 
-        stored = repository.latest_bridge(conn, country=country, source=chosen)
-        if stored is not None:
-            fitted = bridge_scoring.Bridge.from_json(
-                stored["knots"], n_overlap=stored["n_overlap"], rmse=stored["rmse"] or 0.0
-            )
+        fitted = calibration.to_bridge(
+            calibration.latest_bridge(country=country, source=chosen)
+        )
+        if fitted is not None:
             residuals = [fitted.apply(p) - m for p, m in zip(proxy, measured)]
             rmse = (sum(r * r for r in residuals) / len(residuals)) ** 0.5
             table.add_row("RMSE after bridge", f"{rmse:.2f}")
         else:
             table.add_row("RMSE after bridge", "[dim]no bridge fitted[/dim]")
 
-        for row in coverage:
-            table.add_row(f"latest snapshots scored by {row['src']}", str(row["n"]))
+        for src in sorted(coverage):
+            table.add_row(f"keywords scored by {src}", str(coverage[src]))
         console.print(table)
 
         console.print(
@@ -1576,9 +1487,8 @@ def apple_pull(
     low demand, not a missing row.
     """
     setup_logging(verbose)
-    with session() as conn:
-        init_db()
-        rows = repository.list_keywords(conn, country=country, active_only=True)
+    with session() as store:
+        rows = store.list_keywords(country=country, active_only=True)
         keywords = [row["keyword"] for row in rows][: limit or None]
         if not keywords:
             err_console.print(
@@ -1589,7 +1499,7 @@ def apple_pull(
         async def main():
             async with asa_fetcher() as fetcher:
                 return await pipeline.pull_apple_popularity(
-                    conn, keywords, country=country, config=settings, fetcher=fetcher
+                    keywords, country=country, config=settings, fetcher=fetcher
                 )
 
         try:

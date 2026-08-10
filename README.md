@@ -1,13 +1,20 @@
 # aso
 
 Self-hosted ASO keyword research for the iOS App Store. Scores keywords on
-search volume and competition, stores a weekly snapshot of every score so
-trends are visible, and ranks by opportunity.
+search volume and competition, and ranks by opportunity.
 
-Single-user, local, no auth, no server. Optimized for being read and modified.
+Single-user, local, no auth. Optimized for being read and modified.
 
-> **Build status:** complete. CLI, scoring, Apple Search Ads, calibration and
-> the dashboard are all in, with 401 tests.
+State lives in a handful of small JSON files under `data/` — the tracked
+keyword list, the measured observations the fits train on, and the fitted
+bridges. There is no database.
+
+> **Build status:** complete. CLI, HTTP API, scoring, Apple Search Ads and
+> calibration are all in, with 539 tests.
+>
+> **No trend history.** Each keyword carries its latest scores, not a series
+> of them. `refresh` overwrites. What went with the history: the SERP
+> archive, `aso track`, `/movers`, and the per-keyword history endpoint.
 
 ---
 
@@ -18,8 +25,8 @@ Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync                 # create .venv and install everything
 cp .env.example .env    # optional; defaults work without it
-uv run aso init         # create aso.db and apply migrations
 uv run pytest
+uv run aso version      # shows which data/ is loaded, and how much
 ```
 
 `uv run` needs no virtualenv activation. If you'd rather type plain `aso`:
@@ -272,7 +279,7 @@ has extensions and rating mass to be scored on, which is the entire point.
 opportunity = search_score × (100 - competition_score) / 100
 ```
 
-The default sort in the CLI and dashboard.
+The default sort in the CLI and the API.
 
 ### Re-scoring history
 
@@ -317,7 +324,7 @@ What the old rule bought was reliability, so that is bought back explicitly:
 
 - `ASO_APPLE_POPULARITY_ENABLED` gates every call and defaults to **false**.
   With it off, demand scores are byte-identical to what they were before this
-  existed — verified by re-scoring all 400 stored snapshots and seeing zero
+  existed — verified by re-scoring all 231 stored keywords and seeing zero
   move.
 - Every failure path falls back to the proxy. An undocumented endpoint changing
   shape must degrade the score, never void it.
@@ -726,20 +733,25 @@ it starts mattering if you raise the burst.
 
 ### Caching
 
-In SQLite, not memory, so a run is resumable — Ctrl-C a long refresh, restart
-it, and everything already fetched is free. Raw response bodies are stored
-unparsed, so a parser fix can be replayed against captured responses without
-going back to Apple.
+In memory, one cache per process. Raw response bodies are held unparsed, so
+a repeat lookup inside the TTL costs nothing.
 
-| What | Where | TTL |
+| What | Kind | TTL |
 |---|---|---|
-| SERP responses | `http_cache` (kind `serp`) | 3 days |
-| Autocomplete responses | `http_cache` (kind `hints`) | 3 days |
-| App metadata | `apps.fetched_at` | 7 days |
+| SERP responses | `serp` | 3 days |
+| Autocomplete responses | `hints` | 3 days |
+| Chart feeds | `charts` | 1 day |
 
-A response that fails to parse is never cached, and a cache hit does not
-refresh `apps.fetched_at` — otherwise stale metadata would look freshly
-fetched and never be refetched.
+A response that fails to parse is never cached — otherwise one bad body
+poisons the keyword for three days.
+
+**This used to be on disk, and the change has a cost.** The `http_cache`
+table was 459MB of the old 492MB database, mostly SERP bodies kept long past
+the TTL that made them meaningful. Moving it in-process reclaimed all of
+that and gave up resumability: a CLI run that dies partway now restarts from
+nothing, and re-pays the 48 requests for a chart index. The long-lived
+caller — the API server — keeps its cache warm all day, which is where the
+caching actually mattered.
 
 **On run time:** at 15 req/min, a 500-keyword cold refresh costs 500 SERP
 requests plus roughly 3–6 autocomplete requests each, so ~2,000–3,500 requests,
@@ -752,20 +764,18 @@ TTL. Raise `ASO_RATE_LIMIT_PER_MIN` at your own risk.
 ## CLI
 
 ```
-aso init                                # create/upgrade the database
 aso check "meditation timer"            # score once, track nothing
 aso add "candlestick patterns" --country us --tag lcp
 aso import keywords.csv                 # needs a `keyword` column
-aso refresh --tag lcp --country us      # run the pipeline, write a snapshot
-aso rescore                             # recompute all history, no network
+aso refresh --tag lcp --country us      # run the pipeline, record the scores
+aso rescore                             # recompute every score, no network
 aso list --sort opportunity --limit 30
-aso show "candlestick patterns"         # detail + trend + current top 10
-aso track --track-id 627114159          # your app's rank across all keywords
+aso show "candlestick patterns"         # scores and every component
 aso export --format csv -o exports/keywords.csv
 
 aso asa whoami                          # verify ASA credentials, list orgs
 aso asa campaigns
-aso asa pull --days 90                  # measured impressions into the DB
+aso asa pull --days 90                  # measured impressions into data/
 
 aso import-demand keywords.csv --source appfigures --country us --track
 aso calibrate --source appfigures       # fit the search mapping against demand
@@ -774,26 +784,24 @@ aso calibrate --source appfigures       # fit the search mapping against demand
 `check` answers *"is this term worth tracking?"* without committing to it. It
 runs exactly the same scoring code as `refresh` — the two share one
 implementation, and a test asserts they produce identical numbers for the same
-keyword — but stores no keyword, no snapshot and no SERP. The consequence is
-that it leaves no trend history and nothing to compare over time; use `aso add`
-for anything you want to watch. It does populate the HTTP response cache, which
-is a cache rather than a record, and makes a later `refresh` of that keyword
-free.
+keyword — but records nothing; use `aso add` for anything you want to keep a
+score for. It does populate the response cache, which is a cache rather than
+a record, and makes a later `refresh` of that keyword free within the TTL.
 
-Every command applies pending migrations first, so `aso init` is only needed
-if you want to create the database up front.
+Every command creates `data/` on demand, so there is nothing to initialise.
 
 `refresh` also takes `--keyword` for a single term, `--limit` to cap a run,
 `--force` to ignore the caches, and `--verbose` to log every HTTP request.
-**It is safe to Ctrl-C**: each keyword commits on its own and every response is
-cached, so restarting only re-does the keyword that was in flight. A warm
-re-run of an already-refreshed set makes zero requests and finishes in under
-a second.
+**Ctrl-C loses the run.** The keyword list is one JSON file, written once when
+the run finishes, so a refresh interrupted partway records nothing and the
+in-memory response cache dies with the process. That is the trade for not
+holding a database open; use `--limit` to break a long run into pieces you can
+afford to lose.
 
 Keywords are stored lowercased and whitespace-collapsed. "Day Trading" and
 "day trading" are one tracked keyword, not two — App Store search is
-case-insensitive, and storing both would split one keyword's history across
-two rows while doubling its refresh cost.
+case-insensitive, and storing both would double the refresh cost for one
+keyword's worth of information.
 
 `import` takes a CSV with a `keyword` column, plus optional `country` and
 `tags` (comma- or semicolon-separated). Re-importing merges tags rather than
@@ -801,50 +809,6 @@ erroring, so an overlapping file is safe to re-run.
 
 `export` writes every component alongside the final scores, so a spreadsheet
 can re-weight them without touching this tool.
-
-## Dashboard
-
-```bash
-uv run streamlit run dashboard.py
-```
-
-Three views, chosen from the sidebar, both filterable by storefront and tag:
-
-- **Keywords** — every tracked keyword with its latest scores, opportunity
-  rendered as a bar, sortable by clicking a column header.
-- **Keyword detail** — one keyword: current scores, a trend chart across every
-  snapshot, the six competition components *with their weights*, the raw
-  ladder observation, and the current top 10.
-- **Movers** — each keyword's scores against its scores N days ago.
-
-### It is read-only, deliberately
-
-The dashboard never queries Apple and never writes to the database. Streamlit
-re-runs the entire script on every widget interaction, so a view that fetched
-would fire rate-limited requests on every click and reliably earn a 403
-mid-refresh. Collect with `aso refresh`; look here. Two tests assert the file
-imports no HTTP client and calls no write function.
-
-All SQL stays in `aso.repository` — the dashboard is presentation only.
-
-### It listens on loopback only
-
-`.streamlit/config.toml` pins `server.address = "localhost"`. Streamlit's
-default is to bind every interface and print an "External URL" at startup;
-since this tool has **no authentication by design**, that default would
-publish your keyword research and competitor tracking to anyone on the same
-network. Usage telemetry is off there too.
-
-### Movers shows nothing until you have history
-
-A keyword with no snapshot older than the window is **omitted**, not shown as
-zero movement — *not measured then* is a different claim from *did not move*.
-The baseline is the most recent snapshot at or before the cutoff rather than
-"the previous snapshot", so two refreshes in one afternoon can't masquerade as
-a week-over-week change. Expect this view to be empty until you have refreshed
-across at least two weeks.
-
----
 
 ## API
 
@@ -858,8 +822,7 @@ Interactive docs at `/docs`. See `deploy/` for running it under systemd.
 
 Two properties, and the second is the one that is easy to get wrong.
 
-**Loopback**, because this tool has no authentication by design — the same
-reason `.streamlit/config.toml` pins the dashboard to localhost. Other services
+**Loopback**, because this tool has no authentication by design. Other services
 on the host can reach it; nothing else can. From a laptop, use an SSH tunnel.
 
 **The only fetcher**, because `aso.http.Fetcher`'s token bucket lives in one
@@ -877,16 +840,13 @@ interleave request-by-request instead of queueing behind a lock.
 
 | | |
 |---|---|
-| `GET /health` | schema version, db path, counts |
+| `GET /health` | data dir, keyword count, observation and bridge counts |
 | `GET /keywords` | `country`, `tag`, `keyword`, `sort`, `limit`, `include_inactive`, `include_unscored` |
-| `GET /keywords/{id}` | latest snapshot, components with weights |
-| `GET /keywords/{id}/history` | every snapshot, oldest first |
-| `GET /keywords/{id}/serp` | the current top 10 |
-| `GET /movers` | `days`, `country`, `tag` |
+| `GET /keywords/{id}` | latest scores, components with weights |
 | `GET /tags`, `GET /countries` | |
 | `POST /keywords` | add; re-posting merges tags |
 | `PATCH /keywords/{id}` | `active`, `tags` (replaces) |
-| `DELETE /keywords/{id}` | permanent; returns what it destroyed |
+| `DELETE /keywords/{id}` | permanent; returns what it removed |
 | `POST /lookup` | score any keyword live |
 | `POST /refresh` | 202 + job id |
 | `POST /asa/pull`, `POST /popularity/pull` | 202 + job id |
@@ -903,11 +863,14 @@ current.
 
 ### `/lookup` is cached, and pays for the chart index
 
-It reads through the same `http_cache` the CLI does — SERP and autocomplete at
-a 3-day TTL — so a repeat lookup inside that window makes zero requests and
+It reads through the server's in-process response cache — SERP and autocomplete
+at a 3-day TTL — so a repeat lookup inside that window makes zero requests and
 returns in milliseconds. `requests_made` in the response tells you which
-happened; `"force": true` bypasses it. Stored snapshots are never read, so a
+happened; `"force": true` bypasses it. Stored scores are never read, so a
 change to `COMPETITION_WEIGHTS` shows up on the next call either way.
+
+Because the cache is per-process, a server restart empties it: the first
+lookup after a deploy pays full price again.
 
 Unlike `aso check`, it supplies the storefront chart index, so `comp_app_power`
 is present and the competition score is comparable to a tracked keyword's.
@@ -919,16 +882,18 @@ warmed it. Set your client timeout accordingly.
 
 A job is an asyncio task in the API process. Restart the service and running
 jobs are cancelled and their records lost — the run's real record was always
-the snapshots in `aso.db`, plus journald. The registry keeps the last 50.
+the scores in `data/keywords.json`, plus journald. The registry keeps the
+last 50.
 
 One job per kind: a second `POST /refresh` while one is running gets 409, since
-two runs writing snapshots for an overlapping set is simply wrong. A refresh
-and an ASA pull together are fine.
+two runs scoring an overlapping set is simply wrong. A refresh and an ASA pull
+together are fine.
 
 `POST /jobs/{id}/cancel` returns the job already marked `cancelled`, with its
 partial `done` count intact — the route yields to the event loop once so the
 cancelled task can stamp its own terminal status before the response is built.
-Snapshots the run already committed stay committed.
+A cancelled refresh writes nothing: the keyword list is saved when the run
+finishes, so the scores it had already computed are lost with it.
 
 `POST /refresh` rejects `limit` below 1. Zero would select nothing and then
 report "no keywords match that filter", which is false — keywords matched, the
@@ -941,31 +906,52 @@ would mean two token buckets and two job registries behind one URL.
 
 ## Data model
 
-Four tables, in `aso/db.py`. `country` is a real column everywhere anything
-varies by storefront — nothing defaults to `us` at the schema level.
+Five JSON files under `data/`, about 740KB in total. `country` is a real field
+everywhere anything varies by storefront — nothing defaults to `us`.
 
-- **`keywords`** — what's tracked. Unique on `(keyword, country)`.
-- **`snapshots`** — one row per keyword per refresh: final scores, every
-  component, the raw search observations, and a failed-fetch marker.
-- **`apps`** — cached app metadata, keyed `(track_id, country)`.
-- **`serps`** — ranked results per capture. Answers "who moved into the top 10
-  last month" and backs `aso track`.
-- **`http_cache`** — raw response bodies with a fetch timestamp.
+| File | What | Size |
+|---|---|---|
+| `keywords.json` | what's tracked, each with its latest scores, every component and a failed-fetch marker. Unique on `(keyword, country)`. | grows with use |
+| `demand_observations.json` | what a source measured a keyword's demand to be | 3,120 rows |
+| `competition_observations.json` | what a vendor rated its difficulty | 421 rows |
+| `bridges.json` | the fitted maps from this tool's scale onto theirs | 2 |
+| `calibration_corpus.json` | frozen component rows the fits train on | 231 rows |
 
-`aso/repository.py` holds every query, so SQL doesn't leak into the CLI,
-pipeline or dashboard. `aso/pipeline.py` orchestrates a refresh.
+Records are written one per line so `git diff` names the row that changed, and
+writes go through a temp file and a rename so an interrupted write cannot
+truncate the list.
+
+`aso/store.py` owns the keyword list and `aso/calibration.py` owns the rest, so
+file layout doesn't leak into the CLI, the API or the pipeline.
+`aso/pipeline.py` orchestrates a refresh.
+
+### Why the corpus is frozen, and separate
+
+Every fit needs `(observation, components)` pairs, and the component half used
+to come from the latest snapshot of a tracked keyword. Clearing the keyword
+list would therefore have emptied the training set and silently changed every
+fitted constant in `config.py` — the numbers would still be there, but nobody
+could re-derive them.
+
+So the component side is frozen once: 231 keywords as they scored on
+2026-08-09, independent of what you happen to track now. The fits read the
+corpus and the live keyword list together, live winning on `(keyword,
+country)`. Today's fits reproduce exactly against an empty list, and anything
+you track and refresh from here on joins the training set on its own.
 
 ### How a failed fetch is recorded
 
-A keyword whose SERP or hints can't be fetched still gets a snapshot row, with
-`fetch_failed = 1`, the error text, and whatever *did* succeed. The run
+A keyword whose SERP or hints can't be fetched still gets its record updated,
+with `fetch_failed = 1`, the error text, and whatever *did* succeed. The run
 continues — a 500-keyword refresh must not die on keyword 300.
 
 Partial results stay partial. If the SERP succeeds and hints fail, the
 competition score and its components are written and `search_score` stays
-NULL — never zero, never a guess. `opportunity_score` is NULL whenever either
+null — never zero, never a guess. `opportunity_score` is null whenever either
 input is, so a half-measured keyword can't outrank a fully measured one, and
 unscored keywords sort last in every view rather than first.
 
-Migrations are an append-only list in `aso/db.py`; `aso init` applies anything
-pending. Timestamps are ISO-8601 UTC strings.
+A missing file reads as empty, so a fresh install needs no setup step. A file
+that exists but holds the wrong shape raises rather than reading as empty —
+silently treating a broken install as "no data" would discard measurements and
+then write the emptiness back. Timestamps are ISO-8601 UTC strings.

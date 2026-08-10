@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import random
-import sqlite3
 from pathlib import Path
 
 import pytest
 
-from aso import importers, repository
+from aso import calibration, importers
 from aso.scoring import competition as comp
 
 APPFIGURES_CSV = """Keyword,Popularity,Competitiveness,Total
@@ -81,32 +80,29 @@ def test_a_file_without_the_column_names_what_it_expected(tmp_path: Path) -> Non
 # --- storage ---------------------------------------------------------------
 
 
-def test_observations_round_trip_and_reimport_replaces(conn: sqlite3.Connection) -> None:
+def test_observations_round_trip_and_reimport_replaces(store: store_module.Store) -> None:
     rows = [
-        repository.CompetitionWrite("appfigures", "ordinal_100", "Habit Tracker", "us", 82.0)
+        calibration.CompetitionWrite("appfigures", "ordinal_100", "Habit Tracker", "us", 82.0)
     ]
-    assert repository.write_competition_observations(conn, rows) == 1
-    repository.write_competition_observations(
-        conn,
-        [repository.CompetitionWrite("appfigures", "ordinal_100", "habit tracker", "us", 91.0)],
+    assert calibration.write_competition_observations(rows) == 1
+    calibration.write_competition_observations([calibration.CompetitionWrite("appfigures", "ordinal_100", "habit tracker", "us", 91.0)],
     )
-    stored = conn.execute("SELECT keyword, value FROM competition_observations").fetchall()
+    stored = calibration.competition_observations()
     assert [(r["keyword"], r["value"]) for r in stored] == [("habit tracker", 91.0)]
 
 
-def test_samples_join_only_within_a_storefront(conn: sqlite3.Connection) -> None:
+def test_samples_join_only_within_a_storefront(store: store_module.Store) -> None:
     """A German rating must never calibrate a US keyword."""
-    keyword_id, _ = repository.add_keyword(conn, "habit tracker", "us")
-    conn.execute(
-        "INSERT INTO snapshots (keyword_id, captured_at, comp_rating_count, fetch_failed) "
-        "VALUES (?, '2026-08-09T00:00:00Z', 70.0, 0)",
-        (keyword_id.id if hasattr(keyword_id, "id") else keyword_id,),
+    keyword_id, _ = store.add_keyword("habit tracker", "us")
+    store.write_scores(
+        keyword_id,
+        captured_at="2026-08-09T00:00:00Z",
+        comp_rating_count=70.0,
     )
-    repository.write_competition_observations(
-        conn,
-        [repository.CompetitionWrite("appfigures", "ordinal_100", "habit tracker", "de", 82.0)],
+    store.save()
+    calibration.write_competition_observations([calibration.CompetitionWrite("appfigures", "ordinal_100", "habit tracker", "de", 82.0)],
     )
-    assert repository.competition_calibration_samples(conn, "appfigures") == []
+    assert calibration.competition_samples("appfigures", store) == []
 
 
 # --- the fit ---------------------------------------------------------------

@@ -7,15 +7,14 @@ import asyncio
 import pytest
 from fastapi.testclient import TestClient
 
-from aso import db, repository as repo
+from aso import calibration, store as store_module
 from aso.api.app import create_app
 
 
 @pytest.fixture
 def client():
-    db.init_db()
-    with db.session() as conn:
-        repo.add_keyword(conn, "forex", "us", "lcp")
+    with store_module.session() as store:
+        store.add_keyword("forex", "us", "lcp")
     with TestClient(create_app()) as test_client:
         yield test_client
 
@@ -28,7 +27,7 @@ def stub_refresh(monkeypatch):
 
     calls = []
 
-    async def fake_refresh(conn, keywords, *, on_progress=None, fetcher=None, **kwargs):
+    async def fake_refresh(store, keywords, *, on_progress=None, fetcher=None, **kwargs):
         calls.append(fetcher)
         report = pipeline.RefreshReport(started_at="2026-08-09T00:00:00Z")
         for row in keywords:
@@ -75,7 +74,7 @@ def test_the_job_reports_progress_and_completion(client, stub_refresh):
 def test_a_concurrent_refresh_is_refused_with_409(client, monkeypatch):
     from aso.api.routes import jobs as jobs_routes
 
-    async def never_finishes(conn, keywords, *, on_progress=None, **kwargs):
+    async def never_finishes(store, keywords, *, on_progress=None, **kwargs):
         await asyncio.sleep(60)
 
     monkeypatch.setattr(jobs_routes.pipeline, "refresh", never_finishes)
@@ -87,7 +86,7 @@ def test_a_concurrent_refresh_is_refused_with_409(client, monkeypatch):
 def test_a_running_job_can_be_cancelled(client, monkeypatch):
     from aso.api.routes import jobs as jobs_routes
 
-    async def never_finishes(conn, keywords, *, on_progress=None, **kwargs):
+    async def never_finishes(store, keywords, *, on_progress=None, **kwargs):
         await asyncio.sleep(60)
 
     monkeypatch.setattr(jobs_routes.pipeline, "refresh", never_finishes)

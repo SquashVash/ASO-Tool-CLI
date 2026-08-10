@@ -4,11 +4,11 @@ Deliberately not a table. A job IS an asyncio task in this process — kill the
 process and the run dies with it — so a persisted `status='running'` row would
 outlive the thing it describes and lie to whoever read it next. A restart
 loses the history, and the mitigation is that the history was never the record:
-the snapshots in `aso.db` are, plus journald.
+the scores in `data/keywords.json` are, plus journald.
 
-One slot per kind. Two refreshes writing snapshots for an overlapping keyword
-set is wrong; a refresh alongside an ASA pull is not, because they write
-different tables and share one token bucket.
+One slot per kind. Two refreshes scoring an overlapping keyword set is wrong;
+a refresh alongside an ASA pull is not, because they write different files and
+share one token bucket.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from ..db import utcnow
+from ..files import utcnow
 
 logger = logging.getLogger(__name__)
 

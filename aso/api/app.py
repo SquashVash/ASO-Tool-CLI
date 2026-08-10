@@ -13,7 +13,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from ..config import settings
-from ..db import init_db
 from ..http import Fetcher
 from .routes import jobs, keywords, lookup, meta
 from .state import AppState
@@ -23,7 +22,6 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
     async with Fetcher(settings) as fetcher:
         state = AppState(fetcher=fetcher)
         app.state.aso = state

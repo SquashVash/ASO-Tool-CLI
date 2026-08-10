@@ -41,13 +41,12 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 from dataclasses import dataclass, field
 
-from .. import cache
+from ..cache import Cache, default_cache, serp_key
 from ..config import ITUNES_SEARCH_LIMIT, ITUNES_SEARCH_URL, Settings
 from ..config import settings as default_settings
-from ..db import utcnow
+from ..files import utcnow
 from ..http import Fetcher
 
 logger = logging.getLogger(__name__)
@@ -175,78 +174,6 @@ def parse_search_response(
     )
 
 
-def upsert_apps(conn: sqlite3.Connection, apps: list[AppRecord], country: str) -> None:
-    """Cache app metadata, keyed per storefront.
-
-    This is the 7-day app cache: `apps.fetched_at` is refreshed on every write,
-    and readers check it against `settings.app_ttl_days`.
-    """
-    now = utcnow()
-    conn.executemany(
-        """
-        INSERT INTO apps (
-            track_id, country, track_name, subtitle, seller_name,
-            user_rating_count, average_user_rating,
-            current_version_release_date, price, genres, fetched_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (track_id, country) DO UPDATE SET
-            track_name                   = excluded.track_name,
-            subtitle                     = excluded.subtitle,
-            seller_name                  = excluded.seller_name,
-            user_rating_count            = excluded.user_rating_count,
-            average_user_rating          = excluded.average_user_rating,
-            current_version_release_date = excluded.current_version_release_date,
-            price                        = excluded.price,
-            genres                       = excluded.genres,
-            fetched_at                   = excluded.fetched_at
-        """,
-        [
-            (
-                app.track_id,
-                country,
-                app.track_name,
-                app.subtitle,
-                app.seller_name,
-                app.user_rating_count,
-                app.average_user_rating,
-                app.current_version_release_date,
-                app.price,
-                json.dumps(app.genres),
-                now,
-            )
-            for app in apps
-        ],
-    )
-
-
-def load_app(conn: sqlite3.Connection, track_id: int, country: str) -> AppRecord | None:
-    """Read a cached app record, ignoring its age.
-
-    Age only matters when deciding whether to refetch; display paths want
-    whatever is on hand.
-    """
-    row = conn.execute(
-        "SELECT * FROM apps WHERE track_id = ? AND country = ?", (track_id, country)
-    ).fetchone()
-    if row is None:
-        return None
-    try:
-        genres = json.loads(row["genres"]) if row["genres"] else []
-    except json.JSONDecodeError:
-        genres = []
-    return AppRecord(
-        track_id=row["track_id"],
-        track_name=row["track_name"],
-        subtitle=row["subtitle"],
-        seller_name=row["seller_name"],
-        user_rating_count=row["user_rating_count"],
-        average_user_rating=row["average_user_rating"],
-        current_version_release_date=row["current_version_release_date"],
-        price=row["price"],
-        genres=genres if isinstance(genres, list) else [],
-    )
-
-
 class ITunesClient:
     """Cached, rate-limited access to the iTunes Search API.
 
@@ -258,11 +185,11 @@ class ITunesClient:
     def __init__(
         self,
         fetcher: Fetcher,
-        conn: sqlite3.Connection,
+        cache_store: Cache | None = None,
         config: Settings | None = None,
     ) -> None:
         self.fetcher = fetcher
-        self.conn = conn
+        self.cache = cache_store if cache_store is not None else default_cache
         self.settings = config or default_settings
 
     async def search(
@@ -279,23 +206,19 @@ class ITunesClient:
         failed-fetch marker on the snapshot.
         """
         country = country.lower()
-        key = cache.serp_key(term, country, limit)
+        key = serp_key(term, country, limit)
 
         if not force:
-            cached = cache.get(self.conn, key, self.settings.serp_ttl_days)
+            cached = self.cache.get(key, self.settings.serp_ttl_days)
             if cached is not None:
                 logger.debug("serp cache hit for %r (%s)", term, country)
-                serp = parse_search_response(
+                return parse_search_response(
                     cached.body,
                     term,
                     country,
                     captured_at=cached.fetched_at,
                     from_cache=True,
                 )
-                # Deliberately no app upsert on a cache hit: the cached body's
-                # metadata is as old as the cache entry, and rewriting
-                # apps.fetched_at would make stale data look freshly fetched.
-                return serp
 
         body = await self.fetcher.get_text(
             ITUNES_SEARCH_URL,
@@ -310,8 +233,7 @@ class ITunesClient:
         serp = parse_search_response(
             body, term, country, captured_at=utcnow(), from_cache=False
         )
-        cache.put(self.conn, key, CACHE_KIND, body)
-        upsert_apps(self.conn, serp.apps, country)
+        self.cache.put(key, CACHE_KIND, body)
         logger.info(
             "fetched serp for %r (%s): %d results", term, country, len(serp.apps)
         )

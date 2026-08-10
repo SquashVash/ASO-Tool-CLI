@@ -108,11 +108,11 @@ def test_no_session_at_all_names_both_remedies(tmp_path) -> None:
 # --- client behaviour over a transport -------------------------------------
 
 
-async def test_seed_found_in_its_own_results_is_a_measurement(conn, tmp_path) -> None:
+async def test_seed_found_in_its_own_results_is_a_measurement(store, tmp_path) -> None:
     transport = FakeTransport(
         {"habit tracker": envelope(("habit tracker", 52), ("streaks", 25))}
     )
-    client = ApplePopularityClient(transport, conn, make_settings(tmp_path))
+    client = ApplePopularityClient(transport, config=make_settings(tmp_path))
     result = await client.popularity(["habit tracker"], "us")
 
     assert result.rows[0].popularity == pytest.approx(52.0)
@@ -120,10 +120,10 @@ async def test_seed_found_in_its_own_results_is_a_measurement(conn, tmp_path) ->
     assert result.related == {"streaks": 25.0}
 
 
-async def test_seed_absent_from_its_own_results_is_censored(conn, tmp_path) -> None:
+async def test_seed_absent_from_its_own_results_is_censored(store, tmp_path) -> None:
     """The `finsta` case, which is the whole reason censoring exists."""
     transport = FakeTransport({"finsta": envelope(("sendit", 34), ("treads app", 46))})
-    client = ApplePopularityClient(transport, conn, make_settings(tmp_path))
+    client = ApplePopularityClient(transport, config=make_settings(tmp_path))
     result = await client.popularity(["finsta"], "us")
 
     assert result.rows[0].censored
@@ -132,20 +132,18 @@ async def test_seed_absent_from_its_own_results_is_censored(conn, tmp_path) -> N
     assert result.related["sendit"] == pytest.approx(34.0)
 
 
-async def test_disabled_flag_refuses_before_touching_the_transport(conn, tmp_path) -> None:
+async def test_disabled_flag_refuses_before_touching_the_transport(store, tmp_path) -> None:
     transport = FakeTransport({})
-    client = ApplePopularityClient(
-        transport, conn, make_settings(tmp_path, apple_popularity_enabled=False)
-    )
+    client = ApplePopularityClient(transport, config=make_settings(tmp_path, apple_popularity_enabled=False))
     with pytest.raises(ApplePopularityError, match="disabled"):
         await client.popularity(["anything"], "us")
     assert transport.asked == []
 
 
-async def test_a_second_call_is_served_from_cache(conn, tmp_path) -> None:
+async def test_a_second_call_is_served_from_cache(store, tmp_path) -> None:
     transport = FakeTransport({"insta": envelope(("insta", 73))})
     settings = make_settings(tmp_path)
-    client = ApplePopularityClient(transport, conn, settings)
+    client = ApplePopularityClient(transport, config=settings)
 
     await client.popularity(["insta"], "us")
     again = await client.popularity(["insta"], "us")
@@ -155,11 +153,11 @@ async def test_a_second_call_is_served_from_cache(conn, tmp_path) -> None:
     assert again.rows[0].popularity == pytest.approx(73.0)
 
 
-async def test_composed_and_decomposed_forms_match_their_own_row(conn, tmp_path) -> None:
+async def test_composed_and_decomposed_forms_match_their_own_row(store, tmp_path) -> None:
     """Without NFC folding this would record a false censoring."""
     keyword = "i̇nstagram"
     transport = FakeTransport({keyword: envelope((keyword, 61))})
-    client = ApplePopularityClient(transport, conn, make_settings(tmp_path))
+    client = ApplePopularityClient(transport, config=make_settings(tmp_path))
     result = await client.popularity([keyword], "us")
 
     assert result.rows[0].measured

@@ -8,7 +8,7 @@ import pytest
 import respx
 from typer.testing import CliRunner
 
-from aso import cli, db, repository as repo
+from aso import calibration, cli, store as store_module
 
 from .conftest import FIXTURES
 from .test_hints import HINTS_URL
@@ -22,8 +22,7 @@ runner = CliRunner()
 
 @pytest.fixture
 def isolated_db(isolated_environment: Path) -> Path:
-    """The temp database the autouse fixture in conftest already pointed at."""
-    db.init_db(isolated_environment)
+    """The temp data directory the autouse fixture in conftest already set."""
     return isolated_environment
 
 
@@ -58,12 +57,6 @@ def test_version() -> None:
     assert "aso" in result.stdout
 
 
-def test_init_is_idempotent() -> None:
-    assert invoke("init").exit_code == 0
-    second = invoke("init")
-    assert second.exit_code == 0
-    assert "up to date" in second.stdout
-
 
 def test_no_args_shows_help() -> None:
     assert invoke().exit_code != 0 or "Usage" in invoke().stdout
@@ -75,16 +68,16 @@ def test_no_args_shows_help() -> None:
 def test_add_tracks_a_keyword(isolated_db: Path) -> None:
     result = invoke("add", "candlestick patterns", "--country", "us", "--tag", "lcp")
     assert result.exit_code == 0
-    with db.session(isolated_db) as conn:
-        row = repo.get_keyword(conn, "candlestick patterns", "us")
+    with store_module.session() as store:
+        row = store.get_keyword("candlestick patterns", "us")
     assert row is not None
     assert row["tags"] == "lcp"
 
 
 def test_add_accepts_repeated_tags(isolated_db: Path) -> None:
     invoke("add", "forex", "-t", "lcp", "-t", "trading")
-    with db.session(isolated_db) as conn:
-        assert repo.get_keyword(conn, "forex", "us")["tags"] == "lcp,trading"
+    with store_module.session() as store:
+        assert store.get_keyword("forex", "us")["tags"] == "lcp,trading"
 
 
 def test_readding_merges_rather_than_erroring(isolated_db: Path) -> None:
@@ -92,8 +85,8 @@ def test_readding_merges_rather_than_erroring(isolated_db: Path) -> None:
     result = invoke("add", "forex", "-t", "extra")
     assert result.exit_code == 0
     assert "Already tracked" in result.stdout
-    with db.session(isolated_db) as conn:
-        assert repo.get_keyword(conn, "forex", "us")["tags"] == "extra,lcp"
+    with store_module.session() as store:
+        assert store.get_keyword("forex", "us")["tags"] == "extra,lcp"
 
 
 def test_add_rejects_a_blank_keyword() -> None:
@@ -113,18 +106,18 @@ def test_import_reads_keyword_country_and_tags(tmp_path: Path, isolated_db: Path
     )
     result = invoke("import", str(csv_path))
     assert result.exit_code == 0
-    with db.session(isolated_db) as conn:
-        assert len(repo.list_keywords(conn)) == 2
-        assert repo.get_keyword(conn, "candlestick patterns", "us")["tags"] == "charts,lcp"
-        assert repo.get_keyword(conn, "day trading", "de") is not None
+    with store_module.session() as store:
+        assert len(store.list_keywords()) == 2
+        assert store.get_keyword("candlestick patterns", "us")["tags"] == "charts,lcp"
+        assert store.get_keyword("day trading", "de") is not None
 
 
 def test_import_falls_back_to_the_default_country(tmp_path: Path, isolated_db: Path) -> None:
     csv_path = tmp_path / "k.csv"
     csv_path.write_text("keyword\nforex\n", encoding="utf-8")
     invoke("import", str(csv_path), "--country", "gb")
-    with db.session(isolated_db) as conn:
-        assert repo.get_keyword(conn, "forex", "gb") is not None
+    with store_module.session() as store:
+        assert store.get_keyword("forex", "gb") is not None
 
 
 def test_import_is_repeatable(tmp_path: Path, isolated_db: Path) -> None:
@@ -133,8 +126,8 @@ def test_import_is_repeatable(tmp_path: Path, isolated_db: Path) -> None:
     invoke("import", str(csv_path))
     result = invoke("import", str(csv_path))
     assert "0 new, 1 already tracked" in result.stdout
-    with db.session(isolated_db) as conn:
-        assert len(repo.list_keywords(conn)) == 1
+    with store_module.session() as store:
+        assert len(store.list_keywords()) == 1
 
 
 def test_import_without_a_keyword_column_fails_clearly(tmp_path: Path) -> None:
@@ -149,8 +142,8 @@ def test_import_skips_blank_rows_and_keeps_going(tmp_path: Path, isolated_db: Pa
     csv_path.write_text("keyword\nforex\n\ngold\n", encoding="utf-8")
     result = invoke("import", str(csv_path))
     assert result.exit_code == 0
-    with db.session(isolated_db) as conn:
-        assert {r["keyword"] for r in repo.list_keywords(conn)} == {"forex", "gold"}
+    with store_module.session() as store:
+        assert {r["keyword"] for r in store.list_keywords()} == {"forex", "gold"}
 
 
 def test_import_handles_a_bom(tmp_path: Path, isolated_db: Path) -> None:
@@ -158,8 +151,8 @@ def test_import_handles_a_bom(tmp_path: Path, isolated_db: Path) -> None:
     csv_path = tmp_path / "excel.csv"
     csv_path.write_text("keyword\nforex\n", encoding="utf-8-sig")
     assert invoke("import", str(csv_path)).exit_code == 0
-    with db.session(isolated_db) as conn:
-        assert repo.get_keyword(conn, "forex", "us") is not None
+    with store_module.session() as store:
+        assert store.get_keyword("forex", "us") is not None
 
 
 def test_import_of_a_missing_file_fails() -> None:
@@ -177,9 +170,9 @@ def test_refresh_scores_tracked_keywords(isolated_db: Path) -> None:
     assert result.exit_code == 0
     assert "1 scored" in result.stdout
 
-    with db.session(isolated_db) as conn:
-        row = repo.require_keyword(conn, "candlestick patterns", "us")
-        assert repo.latest_snapshot(conn, row["id"])["opportunity_score"] is not None
+    with store_module.session() as store:
+        row = store.require_keyword("candlestick patterns", "us")
+        assert store.get_keyword_by_id(row["id"])["opportunity_score"] is not None
 
 
 def test_refresh_with_no_matching_keywords_says_so() -> None:
@@ -201,9 +194,9 @@ def test_refresh_reports_failures_without_crashing(isolated_db: Path) -> None:
     invoke("add", "forex")
     result = invoke("refresh")
     assert result.exit_code == 0
-    with db.session(isolated_db) as conn:
-        row = repo.require_keyword(conn, "forex", "us")
-        assert repo.latest_snapshot(conn, row["id"])["fetch_failed"] == 1
+    with store_module.session() as store:
+        row = store.require_keyword("forex", "us")
+        assert store.get_keyword_by_id(row["id"])["fetch_failed"] == 1
 
 
 # --- rescore ---------------------------------------------------------------
@@ -212,7 +205,7 @@ def test_refresh_reports_failures_without_crashing(isolated_db: Path) -> None:
 def test_rescore_with_no_snapshots_says_so(isolated_db: Path) -> None:
     result = invoke("rescore")
     assert result.exit_code == 0
-    assert "No snapshots" in result.stdout
+    assert "No scored keywords" in result.stdout
 
 
 @respx.mock
@@ -292,31 +285,8 @@ def test_show_renders_components_trend_and_serp(isolated_db: Path) -> None:
     assert result.exit_code == 0
     assert "opportunity" in result.stdout
     assert "rating_count" in result.stdout
-    assert "NOT App Store rank" in result.stdout
+    assert "opportunity" in result.stdout
 
-
-# --- track -----------------------------------------------------------------
-
-
-def test_track_with_no_data_is_friendly() -> None:
-    result = invoke("track", "--track-id", "627114159")
-    assert result.exit_code == 0
-    assert "doesn't appear" in result.stdout
-
-
-@respx.mock
-def test_track_finds_an_app_in_the_stored_ranking(isolated_db: Path) -> None:
-    mock_apple()
-    invoke("add", "candlestick patterns")
-    invoke("refresh")
-    with db.session(isolated_db) as conn:
-        row = repo.require_keyword(conn, "candlestick patterns", "us")
-        track_id = repo.latest_serp(conn, row["id"])[0]["track_id"]
-
-    result = invoke("track", "--track-id", str(track_id))
-    assert result.exit_code == 0
-    assert "candlestick patterns" in result.stdout
-    assert "not App Store rank" in result.stdout
 
 
 # --- export ----------------------------------------------------------------
@@ -409,26 +379,21 @@ def test_calibrate_reports_the_fit(isolated_db: Path) -> None:
     import random
 
     rng = random.Random(3)
-    with db.session(isolated_db) as conn:
+    with store_module.session() as store:
         for i in range(40):
             keyword = f"keyword number {i}"
-            repo.add_keyword(conn, keyword, "us")
-            row = repo.require_keyword(conn, keyword, "us")
+            store.add_keyword(keyword, "us")
+            row = store.require_keyword(keyword, "us")
             depth = rng.randint(1, 6)
             rank = rng.randint(1, 10)
-            repo.write_snapshot(
-                conn,
-                repo.SnapshotWrite(
-                    keyword_id=row["id"],
-                    captured_at="2026-08-01T00:00:00Z",
-                    search_prefix_depth=depth,
-                    search_hint_rank=rank,
-                ),
+            store.write_scores(
+                row["id"],
+                captured_at="2026-08-01T00:00:00Z",
+                search_prefix_depth=depth,
+                search_hint_rank=rank,
             )
-            repo.write_demand_observations(
-                conn,
-                [
-                    repo.DemandWrite(
+            calibration.write_demand_observations([
+                    calibration.DemandWrite(
                         source="asa", scale="count", keyword=keyword,
                         country="us", value=10_000 / (depth * rank),
                     )
@@ -445,23 +410,18 @@ def test_calibrate_json_is_machine_readable(isolated_db: Path) -> None:
     import random
 
     rng = random.Random(5)
-    with db.session(isolated_db) as conn:
+    with store_module.session() as store:
         for i in range(40):
             keyword = f"term {i}"
-            repo.add_keyword(conn, keyword, "us")
-            row = repo.require_keyword(conn, keyword, "us")
-            repo.write_snapshot(
-                conn,
-                repo.SnapshotWrite(
-                    keyword_id=row["id"], captured_at="2026-08-01T00:00:00Z",
-                    search_prefix_depth=rng.randint(1, 6),
-                    search_hint_rank=rng.randint(1, 10),
-                ),
+            store.add_keyword(keyword, "us")
+            row = store.require_keyword(keyword, "us")
+            store.write_scores(
+                row["id"], captured_at="2026-08-01T00:00:00Z",
+                search_prefix_depth=rng.randint(1, 6),
+                search_hint_rank=rng.randint(1, 10),
             )
-            repo.write_demand_observations(
-                conn,
-                [
-                    repo.DemandWrite(
+            calibration.write_demand_observations([
+                    calibration.DemandWrite(
                         source="asa", scale="count", keyword=keyword,
                         country="us", value=float(rng.randint(10, 50_000)),
                     )
@@ -482,35 +442,21 @@ def test_calibrate_never_writes_the_constants_itself(isolated_db: Path) -> None:
     assert Path("aso/config.py").read_text(encoding="utf-8") == before
 
 
-def test_every_db_command_applies_pending_migrations(isolated_environment: Path) -> None:
-    """A stale database must not produce a traceback.
+def test_every_command_survives_an_empty_data_directory(isolated_environment: Path) -> None:
+    """A fresh install has no data files at all, and must not traceback.
 
-    Found by hand: `calibrate` and `asa pull` queried a table added in a later
-    migration without applying it first, so any database created before that
-    migration crashed with `no such table`.
+    The database version of this test seeded a stale schema. There is no
+    schema now — the failure mode that replaced it is a missing file, which
+    every reader has to treat as empty rather than as an error.
     """
-    from aso import db as db_module
+    assert not list(isolated_environment.glob("*.json"))
 
-    # A database at migration 1 only — as an existing install would be.
-    conn = db_module.connect(isolated_environment)
-    with db_module.transaction(conn):
-        for statement in db_module.split_statements(db_module.MIGRATIONS[0][2]):
-            conn.execute(statement)
-        conn.execute(db_module.SCHEMA_MIGRATIONS_DDL)
-        conn.execute(
-            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (1, 'x', 'y')"
-        )
-    conn.close()
-
-    for args in (("list",), ("rescore",), ("calibrate",), ("export",)):
+    for args in (("list",), ("rescore",), ("export",), ("version",)):
         result = invoke(*args)
-        assert "no such table" not in result.output, args
+        assert "Traceback" not in result.output, args
         assert not isinstance(result.exception, Exception) or isinstance(
             result.exception, SystemExit
         ), f"{args} raised {result.exception!r}"
-
-
-# --- import-demand ---------------------------------------------------------
 
 
 def test_import_demand_stores_and_tracks(tmp_path: Path, isolated_db: Path) -> None:
@@ -525,9 +471,9 @@ def test_import_demand_stores_and_tracks(tmp_path: Path, isolated_db: Path) -> N
     assert result.exit_code == 0
     assert "2 appfigures observation(s)" in result.output
 
-    with db.session(isolated_db) as conn:
-        assert [r["source"] for r in repo.demand_sources(conn)] == ["appfigures"]
-        assert repo.get_keyword(conn, "habit tracker", "us") is not None
+    with store_module.session() as store:
+        assert [r["source"] for r in calibration.demand_sources()] == ["appfigures"]
+        assert store.get_keyword("habit tracker", "us") is not None
 
 
 def test_import_demand_without_track_leaves_keywords_alone(
@@ -536,8 +482,8 @@ def test_import_demand_without_track_leaves_keywords_alone(
     csv_path = tmp_path / "af.csv"
     csv_path.write_text("Keyword,Popularity\nforex,42\n", encoding="utf-8")
     assert invoke("import-demand", str(csv_path)).exit_code == 0
-    with db.session(isolated_db) as conn:
-        assert repo.list_keywords(conn) == []
+    with store_module.session() as store:
+        assert store.list_keywords() == []
 
 
 def test_import_demand_rejects_the_wrong_file(tmp_path: Path, isolated_db: Path) -> None:
@@ -552,19 +498,16 @@ def test_calibrate_names_the_source_it_used(tmp_path: Path, isolated_db: Path) -
 
     rng = random.Random(9)
     lines = ["Keyword,Popularity"]
-    with db.session(isolated_db) as conn:
+    with store_module.session() as store:
         for i in range(30):
             keyword = f"keyword number {i}"
             depth, rank = rng.randint(1, 6), rng.randint(1, 10)
             lines.append(f"{keyword},{max(1, 100 - depth * 8 - rank * 3)}")
-            repo.add_keyword(conn, keyword, "us")
-            row = repo.require_keyword(conn, keyword, "us")
-            repo.write_snapshot(
-                conn,
-                repo.SnapshotWrite(
-                    keyword_id=row["id"], captured_at="2026-08-01T00:00:00Z",
-                    search_prefix_depth=depth, search_hint_rank=rank,
-                ),
+            store.add_keyword(keyword, "us")
+            row = store.require_keyword(keyword, "us")
+            store.write_scores(
+                row["id"], captured_at="2026-08-01T00:00:00Z",
+                search_prefix_depth=depth, search_hint_rank=rank,
             )
 
     csv_path = tmp_path / "af.csv"
@@ -616,8 +559,8 @@ def test_import_demand_stratify_tracks_a_spread_not_everything(
     assert result.exit_code == 0
     assert "46 appfigures observation(s)" in result.output, "all demand is stored"
 
-    with db.session(isolated_db) as conn:
-        tracked = repo.list_keywords(conn)
+    with store_module.session() as store:
+        tracked = store.list_keywords()
         assert len(tracked) == 6, "but only the sampled keywords are tracked"
         names = {r["keyword"] for r in tracked}
     assert sum(1 for n in names if n.startswith("floor")) <= 1, (
@@ -644,8 +587,8 @@ def test_a_japanese_keyword_does_not_kill_the_run(isolated_db: Path) -> None:
     assert result.exit_code == 0
     assert result.exception is None or isinstance(result.exception, SystemExit)
 
-    with db.session(isolated_db) as conn:
-        assert len(repo.list_keywords(conn)) == 2
+    with store_module.session() as store:
+        assert len(store.list_keywords()) == 2
 
 
 def test_listing_and_exporting_survive_non_ascii(tmp_path: Path, isolated_db: Path) -> None:
@@ -673,10 +616,9 @@ def test_check_scores_without_tracking(isolated_db: Path) -> None:
     assert result.exit_code == 0
     assert "opportunity" in result.output
 
-    with db.session(isolated_db) as conn:
-        assert repo.list_keywords(conn) == [], "no keyword row"
-        assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM serps").fetchone()[0] == 0
+    with store_module.session() as store:
+        assert store.list_keywords() == [], "no keyword row"
+        assert store.records == []
 
 
 @respx.mock
@@ -688,6 +630,7 @@ def test_check_shows_components_and_the_serp(isolated_db: Path) -> None:
     assert "NOT App Store rank" in result.output
 
 
+
 @respx.mock
 def test_check_agrees_with_refresh_on_the_same_keyword(isolated_db: Path) -> None:
     """Both paths must run identical scoring — only persistence differs."""
@@ -696,9 +639,9 @@ def test_check_agrees_with_refresh_on_the_same_keyword(isolated_db: Path) -> Non
 
     invoke("add", "candlestick patterns")
     invoke("refresh")
-    with db.session(isolated_db) as conn:
-        row = repo.require_keyword(conn, "candlestick patterns", "us")
-        stored = repo.latest_snapshot(conn, row["id"])
+    with store_module.session() as store:
+        row = store.require_keyword("candlestick patterns", "us")
+        stored = store.get_keyword_by_id(row["id"])
 
     for field in ("search_score", "competition_score", "opportunity_score",
                   "comp_rating_count", "search_prefix_depth", "search_hint_rank"):

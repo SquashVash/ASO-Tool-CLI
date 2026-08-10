@@ -6,7 +6,6 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
-from aso import db
 from aso.api.app import create_app
 
 from .test_pipeline import mock_both
@@ -17,7 +16,6 @@ KEYWORD = "candlestick patterns"
 
 @pytest.fixture
 def client():
-    db.init_db()
     with TestClient(create_app()) as test_client:
         yield test_client
 

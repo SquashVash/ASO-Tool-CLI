@@ -135,7 +135,7 @@ def test_a_missing_file_is_reported_not_raised_raw(tmp_path: Path) -> None:
 
 
 def demand(value: float, keyword: str = "k"):
-    from aso.repository import DemandWrite
+    from aso.calibration import DemandWrite
 
     return DemandWrite(
         source="appfigures", scale=SCALE_ORDINAL_100,

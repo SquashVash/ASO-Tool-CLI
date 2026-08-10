@@ -13,7 +13,7 @@ import asyncio
 
 import httpx
 
-from aso import db, repository
+from aso import calibration, store as store_module
 from aso.api.app import create_app
 
 
@@ -29,9 +29,8 @@ async def test_ten_overlapping_health_requests_all_succeed():
     handler in this API has it: `/health`, `/movers`, `/tags`, `/countries`,
     the six `/keywords*` routes, `/rescore`.
     """
-    db.init_db()
-    with db.session() as conn:
-        repository.add_keyword(conn, "forex", "us")
+    with store_module.session() as store:
+        store.add_keyword("forex", "us")
 
     app = create_app()
     transport = httpx.ASGITransport(app=app)
@@ -47,10 +46,9 @@ async def test_ten_overlapping_health_requests_all_succeed():
 
 async def test_overlapping_keyword_reads_all_succeed():
     """The same hazard on a route that actually queries rows."""
-    db.init_db()
-    with db.session() as conn:
-        repository.add_keyword(conn, "forex", "us")
-        repository.add_keyword(conn, "trading", "us")
+    with store_module.session() as store:
+        store.add_keyword("forex", "us")
+        store.add_keyword("trading", "us")
 
     app = create_app()
     transport = httpx.ASGITransport(app=app)

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import logging
-import sqlite3
 from datetime import date
 
 import httpx
 import pytest
 import respx
 
-from aso import pipeline, repository as repo
+from aso import calibration, pipeline, store as store_module
 from aso.clients import asa
 from aso.config import ASA_TOKEN_URL
 
@@ -39,7 +38,7 @@ def us_campaign(campaign_id: int = 1, name: str = "US search") -> dict:
 
 
 @respx.mock
-async def test_pull_stores_measured_impressions(conn: sqlite3.Connection) -> None:
+async def test_pull_stores_measured_impressions(store: store_module.Store) -> None:
     mock_token()
     respx.get(CAMPAIGNS_URL).mock(return_value=campaigns_response(us_campaign()))
     respx.post(report_url(1)).mock(
@@ -49,19 +48,22 @@ async def test_pull_stores_measured_impressions(conn: sqlite3.Connection) -> Non
     )
 
     async with fast_fetcher() as fetcher:
-        report = await pipeline.pull_asa(
-            conn, config=configured_settings(), fetcher=fetcher, **WINDOW
+        report = await pipeline.pull_asa(config=configured_settings(), fetcher=fetcher, **WINDOW
         )
 
     assert report.campaigns_seen == 1
     assert report.terms_written == 2
-    totals = {r["search_term"]: r["impressions"] for r in repo.asa_term_totals(conn)}
-    assert totals == {"day trading": 5200, "forex": 130}
+    totals = {
+        r["keyword"]: r["value"]
+        for r in calibration.demand_observations()
+        if r["source"] == "asa"
+    }
+    assert totals == {"day trading": 5200.0, "forex": 130.0}
 
 
 @respx.mock
 async def test_pull_normalizes_terms_to_match_tracked_keywords(
-    conn: sqlite3.Connection,
+    store: store_module.Store,
 ) -> None:
     """ASA returns whatever the user typed; keywords are stored lowercased."""
     mock_token()
@@ -71,14 +73,14 @@ async def test_pull_normalizes_terms_to_match_tracked_keywords(
     )
 
     async with fast_fetcher() as fetcher:
-        await pipeline.pull_asa(conn, config=configured_settings(), fetcher=fetcher, **WINDOW)
+        await pipeline.pull_asa(config=configured_settings(), fetcher=fetcher, **WINDOW)
 
-    assert repo.asa_term_totals(conn)[0]["search_term"] == "day trading"
+    assert [r["keyword"] for r in calibration.demand_observations()] == ["day trading"]
 
 
 @respx.mock
 async def test_repulling_the_same_window_updates_rather_than_doubles(
-    conn: sqlite3.Connection,
+    store: store_module.Store,
 ) -> None:
     """`pull` must be safe to re-run after a partial failure."""
     mock_token()
@@ -88,16 +90,16 @@ async def test_repulling_the_same_window_updates_rather_than_doubles(
     )
 
     async with fast_fetcher() as fetcher:
-        await pipeline.pull_asa(conn, config=configured_settings(), fetcher=fetcher, **WINDOW)
-        await pipeline.pull_asa(conn, config=configured_settings(), fetcher=fetcher, **WINDOW)
+        await pipeline.pull_asa(config=configured_settings(), fetcher=fetcher, **WINDOW)
+        await pipeline.pull_asa(config=configured_settings(), fetcher=fetcher, **WINDOW)
 
-    totals = repo.asa_term_totals(conn)
+    totals = calibration.demand_observations()
     assert len(totals) == 1
-    assert totals[0]["impressions"] == 100, "summing a repeat would invent demand"
+    assert totals[0]["value"] == 100.0, "summing a repeat would invent demand"
 
 
 @respx.mock
-async def test_two_campaigns_bidding_on_one_term_sum(conn: sqlite3.Connection) -> None:
+async def test_two_campaigns_bidding_on_one_term_sum(store: store_module.Store) -> None:
     """Different campaigns saw genuinely different impressions. Those add."""
     mock_token()
     respx.get(CAMPAIGNS_URL).mock(
@@ -111,14 +113,14 @@ async def test_two_campaigns_bidding_on_one_term_sum(conn: sqlite3.Connection) -
     )
 
     async with fast_fetcher() as fetcher:
-        await pipeline.pull_asa(conn, config=configured_settings(), fetcher=fetcher, **WINDOW)
+        await pipeline.pull_asa(config=configured_settings(), fetcher=fetcher, **WINDOW)
 
-    assert repo.asa_term_totals(conn)[0]["impressions"] == 125
+    assert calibration.demand_observations()[0]["value"] == 125.0
 
 
 @respx.mock
 async def test_multi_country_campaigns_are_excluded_from_calibration(
-    conn: sqlite3.Connection,
+    store: store_module.Store,
 ) -> None:
     """A term can't be attributed to a storefront, so it must not train the fit."""
     mock_token()
@@ -132,18 +134,17 @@ async def test_multi_country_campaigns_are_excluded_from_calibration(
     )
 
     async with fast_fetcher() as fetcher:
-        report = await pipeline.pull_asa(
-            conn, config=configured_settings(), fetcher=fetcher, **WINDOW
+        report = await pipeline.pull_asa(config=configured_settings(), fetcher=fetcher, **WINDOW
         )
 
-    assert report.terms_written == 1, "the row is kept"
-    assert repo.asa_term_totals(conn) == [], "but never used for calibration"
+    assert report.terms_written == 0, "nothing attributable was learned"
+    assert calibration.demand_observations() == [], "so nothing trains the fit"
     assert report.campaigns_skipped, "and the user is told why"
 
 
 @respx.mock
 async def test_credentials_never_reach_the_logs(
-    conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+    store: store_module.Store, caplog: pytest.LogCaptureFixture
 ) -> None:
     """`--verbose` must not print a usable client assertion into a terminal or log file."""
     respx.post(ASA_TOKEN_URL).mock(return_value=httpx.Response(500, text="boom"))
@@ -163,30 +164,25 @@ async def test_credentials_never_reach_the_logs(
 
 @respx.mock
 async def test_calibration_samples_join_observations_to_impressions(
-    conn: sqlite3.Connection,
+    store: store_module.Store,
 ) -> None:
-    repo.add_keyword(conn, "day trading", "us")
-    keyword = repo.require_keyword(conn, "day trading", "us")
-    repo.write_snapshot(
-        conn,
-        repo.SnapshotWrite(
-            keyword_id=keyword["id"],
-            captured_at="2026-08-01T00:00:00Z",
-            search_prefix_depth=3,
-            search_hint_rank=2,
-        ),
+    store.add_keyword("day trading", "us")
+    keyword = store.require_keyword("day trading", "us")
+    store.write_scores(
+        keyword["id"],
+        captured_at="2026-08-01T00:00:00Z",
+        search_prefix_depth=3,
+        search_hint_rank=2,
     )
-    repo.write_demand_observations(
-        conn,
-        [
-            repo.DemandWrite(
+    calibration.write_demand_observations([
+            calibration.DemandWrite(
                 source="asa", scale="count", keyword="day trading",
                 country="us", value=5200.0,
             )
         ],
     )
 
-    samples = pipeline.calibration_from_db(conn, "asa")
+    samples = pipeline.calibration_for("asa", store)
     assert len(samples) == 1
     assert samples[0].prefix_depth == 3
     assert samples[0].hint_rank == 2
@@ -195,83 +191,68 @@ async def test_calibration_samples_join_observations_to_impressions(
 
 
 def test_a_failed_hints_fetch_never_becomes_a_training_point(
-    conn: sqlite3.Connection,
+    store: store_module.Store,
 ) -> None:
     """The single most important guard: a measurement failure is not an observation."""
-    repo.add_keyword(conn, "forex", "us")
-    keyword = repo.require_keyword(conn, "forex", "us")
-    repo.write_snapshot(
-        conn,
-        repo.SnapshotWrite(
-            keyword_id=keyword["id"],
-            captured_at="2026-08-01T00:00:00Z",
-            search_prefix_depth=None,
-            search_hint_rank=None,
-            fetch_failed=True,
-            fetch_error="hints: HTTP 403",
-        ),
+    store.add_keyword("forex", "us")
+    keyword = store.require_keyword("forex", "us")
+    store.write_scores(
+        keyword["id"],
+        captured_at="2026-08-01T00:00:00Z",
+        search_prefix_depth=None,
+        search_hint_rank=None,
+        fetch_failed=True,
+        fetch_error="hints: HTTP 403",
     )
-    repo.write_demand_observations(
-        conn,
-        [
-            repo.DemandWrite(
+    calibration.write_demand_observations([
+            calibration.DemandWrite(
                 source="asa", scale="count", keyword="forex",
                 country="us", value=900.0,
             )
         ],
     )
 
-    assert pipeline.calibration_from_db(conn, "asa") == []
+    assert pipeline.calibration_for("asa", store) == []
 
 
-def test_calibration_only_joins_within_a_storefront(conn: sqlite3.Connection) -> None:
+def test_calibration_only_joins_within_a_storefront(store: store_module.Store) -> None:
     """A German impression count must not calibrate a US keyword."""
-    repo.add_keyword(conn, "forex", "us")
-    keyword = repo.require_keyword(conn, "forex", "us")
-    repo.write_snapshot(
-        conn,
-        repo.SnapshotWrite(
-            keyword_id=keyword["id"], captured_at="2026-08-01T00:00:00Z",
-            search_prefix_depth=2, search_hint_rank=1,
-        ),
+    store.add_keyword("forex", "us")
+    keyword = store.require_keyword("forex", "us")
+    store.write_scores(
+        keyword["id"], captured_at="2026-08-01T00:00:00Z",
+        search_prefix_depth=2, search_hint_rank=1,
     )
-    repo.write_demand_observations(
-        conn,
-        [
-            repo.DemandWrite(
+    calibration.write_demand_observations([
+            calibration.DemandWrite(
                 source="asa", scale="count", keyword="forex",
                 country="de", value=900.0,
             )
         ],
     )
 
-    assert pipeline.calibration_from_db(conn, "asa") == []
+    assert pipeline.calibration_for("asa", store) == []
 
 
 def test_calibration_uses_only_the_most_recent_observation(
-    conn: sqlite3.Connection,
+    store: store_module.Store,
 ) -> None:
-    repo.add_keyword(conn, "forex", "us")
-    keyword = repo.require_keyword(conn, "forex", "us")
+    store.add_keyword("forex", "us")
+    keyword = store.require_keyword("forex", "us")
     for captured_at, depth in (("2026-06-01T00:00:00Z", 6), ("2026-08-01T00:00:00Z", 2)):
-        repo.write_snapshot(
-            conn,
-            repo.SnapshotWrite(
-                keyword_id=keyword["id"], captured_at=captured_at,
-                search_prefix_depth=depth, search_hint_rank=1,
-            ),
+        store.write_scores(
+            keyword["id"], captured_at=captured_at,
+            search_prefix_depth=depth, search_hint_rank=1,
         )
-    repo.write_demand_observations(
-        conn,
-        [
-            repo.DemandWrite(
+    calibration.write_demand_observations([
+            calibration.DemandWrite(
                 source="asa", scale="count", keyword="forex",
                 country="us", value=900.0,
             )
         ],
     )
 
-    samples = pipeline.calibration_from_db(conn, "asa")
+    samples = pipeline.calibration_for("asa", store)
     assert len(samples) == 1
     assert samples[0].prefix_depth == 2
 
@@ -317,7 +298,7 @@ def configured_settings():
 
 @respx.mock
 async def test_pull_projects_into_the_demand_table_calibration_reads(
-    conn: sqlite3.Connection,
+    store: store_module.Store,
 ) -> None:
     """ASA and imported sources must land in one place, so calibrate has one path."""
     mock_token()
@@ -327,15 +308,15 @@ async def test_pull_projects_into_the_demand_table_calibration_reads(
     )
 
     async with fast_fetcher() as fetcher:
-        await pipeline.pull_asa(conn, config=configured_settings(), fetcher=fetcher, **WINDOW)
+        await pipeline.pull_asa(config=configured_settings(), fetcher=fetcher, **WINDOW)
 
-    sources = repo.demand_sources(conn)
+    sources = calibration.demand_sources()
     assert [(r["source"], r["scale"]) for r in sources] == [("asa", "count")]
 
 
 @respx.mock
 async def test_multi_country_pull_writes_no_demand_observation(
-    conn: sqlite3.Connection,
+    store: store_module.Store,
 ) -> None:
     """Unattributable to a storefront, so it must not reach the fit at all."""
     mock_token()
@@ -349,66 +330,56 @@ async def test_multi_country_pull_writes_no_demand_observation(
     )
 
     async with fast_fetcher() as fetcher:
-        await pipeline.pull_asa(conn, config=configured_settings(), fetcher=fetcher, **WINDOW)
+        await pipeline.pull_asa(config=configured_settings(), fetcher=fetcher, **WINDOW)
 
-    assert repo.demand_sources(conn) == []
+    assert calibration.demand_sources() == []
 
 
-def test_sources_never_mix_in_one_fit(conn: sqlite3.Connection) -> None:
+def test_sources_never_mix_in_one_fit(store: store_module.Store) -> None:
     """An impression count and a popularity rank are not the same quantity."""
-    repo.add_keyword(conn, "forex", "us")
-    keyword = repo.require_keyword(conn, "forex", "us")
-    repo.write_snapshot(
-        conn,
-        repo.SnapshotWrite(
-            keyword_id=keyword["id"], captured_at="2026-08-01T00:00:00Z",
-            search_prefix_depth=2, search_hint_rank=1,
-        ),
+    store.add_keyword("forex", "us")
+    keyword = store.require_keyword("forex", "us")
+    store.write_scores(
+        keyword["id"], captured_at="2026-08-01T00:00:00Z",
+        search_prefix_depth=2, search_hint_rank=1,
     )
-    repo.write_demand_observations(
-        conn,
-        [
-            repo.DemandWrite(source="asa", scale="count", keyword="forex",
+    calibration.write_demand_observations([
+            calibration.DemandWrite(source="asa", scale="count", keyword="forex",
                              country="us", value=5000.0),
-            repo.DemandWrite(source="appfigures", scale="ordinal_100", keyword="forex",
+            calibration.DemandWrite(source="appfigures", scale="ordinal_100", keyword="forex",
                              country="us", value=42.0),
         ],
     )
 
-    asa_samples = pipeline.calibration_from_db(conn, "asa")
-    af_samples = pipeline.calibration_from_db(conn, "appfigures")
+    asa_samples = pipeline.calibration_for("asa", store)
+    af_samples = pipeline.calibration_for("appfigures", store)
     assert [s.impressions for s in asa_samples] == [5000.0]
     assert [s.impressions for s in af_samples] == [42.0]
     assert af_samples[0].scale == "ordinal_100"
 
 
-def test_calibration_skips_deactivated_keywords(conn: sqlite3.Connection) -> None:
+def test_calibration_skips_deactivated_keywords(store: store_module.Store) -> None:
     """`active = 0` must mean out of the working set, calibration included.
 
     Otherwise deactivating an over-represented block of keywords appears to do
     nothing, because their old observations keep training the fit.
     """
     for keyword, active in (("kept", True), ("dropped", False)):
-        repo.add_keyword(conn, keyword, "us")
-        row = repo.require_keyword(conn, keyword, "us")
-        repo.write_snapshot(
-            conn,
-            repo.SnapshotWrite(
-                keyword_id=row["id"], captured_at="2026-08-01T00:00:00Z",
-                search_prefix_depth=3, search_hint_rank=1,
-            ),
+        store.add_keyword(keyword, "us")
+        row = store.require_keyword(keyword, "us")
+        store.write_scores(
+            row["id"], captured_at="2026-08-01T00:00:00Z",
+            search_prefix_depth=3, search_hint_rank=1,
         )
-        repo.write_demand_observations(
-            conn,
-            [
-                repo.DemandWrite(
+        calibration.write_demand_observations([
+                calibration.DemandWrite(
                     source="appfigures", scale="ordinal_100",
                     keyword=keyword, country="us", value=50.0,
                 )
             ],
         )
         if not active:
-            repo.set_active(conn, row["id"], False)
+            store.set_active(row["id"], False)
 
-    samples = repo.calibration_samples(conn, "appfigures")
+    samples = calibration.demand_samples("appfigures", store)
     assert [r["keyword"] for r in samples] == ["kept"]

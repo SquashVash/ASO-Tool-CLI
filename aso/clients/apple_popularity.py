@@ -52,12 +52,11 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from .. import cache
+from ..cache import Cache, default_cache, popularity_key
 from ..config import (
     APPLE_POPULARITY_CEILING,
     APPLE_POPULARITY_FLOOR,
@@ -228,11 +227,11 @@ class ApplePopularityClient:
     def __init__(
         self,
         transport: PopularityTransport,
-        conn: sqlite3.Connection,
+        cache_store: Cache | None = None,
         config: Settings | None = None,
     ) -> None:
         self.transport = transport
-        self.conn = conn
+        self.cache = cache_store if cache_store is not None else default_cache
         self.settings = config or default_settings
 
     async def popularity(
@@ -247,8 +246,8 @@ class ApplePopularityClient:
         result = PopularityResult()
 
         for keyword in keywords:
-            key = cache.popularity_key(keyword, country)
-            cached = None if force else cache.get(self.conn, key, ttl)
+            key = popularity_key(keyword, country)
+            cached = None if force else self.cache.get(key, ttl)
             if cached is not None:
                 stored = json.loads(cached.body)
                 result.rows.append(
@@ -283,7 +282,7 @@ class ApplePopularityClient:
                     censored=own is None,
                 )
             )
-            cache.put(self.conn, key, CACHE_KIND, json.dumps({"popularity": own}))
+            self.cache.put(key, CACHE_KIND, json.dumps({"popularity": own}))
 
         logger.info(
             "popularity for %d keyword(s) in %s: %d scored, %d censored, "

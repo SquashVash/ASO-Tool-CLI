@@ -1,51 +1,41 @@
-"""Liveness and provenance: what database is this, and how current is it."""
+"""Liveness and provenance: what data is loaded, and how much of it."""
 
 from __future__ import annotations
 
-import sqlite3
+from fastapi import APIRouter, Depends
 
-from fastapi import APIRouter, Depends, Query
-
-from ... import repository
+from ... import calibration
 from ...config import settings
-from ...db import applied_versions
-from ..deps import get_conn
-from ..schemas import MoverRow
+from ...store import Store
+from ..deps import get_store
 
 router = APIRouter(tags=["meta"])
 
 
 @router.get("/health")
-def health(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, object]:
-    versions = applied_versions(conn)
+def health(store: Store = Depends(get_store)) -> dict[str, object]:
+    """Enough to tell a live server from a live server pointed at nothing.
+
+    The counts are the useful part. A server reading an empty `data/` still
+    answers 200 on every endpoint — it just scores everything off the proxy —
+    so "ok" alone would not distinguish a healthy install from one whose
+    calibration files never got deployed.
+    """
     return {
         "status": "ok",
-        "db_path": str(settings.db_path),
-        "schema_version": max(versions) if versions else 0,
-        "keywords": len(repository.list_keywords(conn, active_only=False)),
-        "countries": repository.countries(conn),
+        "data_dir": str(settings.data_dir),
+        "keywords": len(store.records),
+        "countries": store.countries(),
+        "demand_observations": len(calibration.demand_observations()),
+        "bridges": len(calibration.bridges()),
     }
 
 
-@router.get("/movers", response_model=list[MoverRow])
-def movers(
-    days: int = Query(7, ge=1),
-    country: str | None = None,
-    tag: str | None = None,
-    include_inactive: bool = False,
-    conn: sqlite3.Connection = Depends(get_conn),
-) -> list[MoverRow]:
-    rows = repository.score_movers(
-        conn, days=days, country=country, tag=tag, active_only=not include_inactive
-    )
-    return [MoverRow.from_row(row) for row in rows]
-
-
 @router.get("/tags", response_model=list[str])
-def tags(conn: sqlite3.Connection = Depends(get_conn)) -> list[str]:
-    return repository.all_tags(conn)
+def tags(store: Store = Depends(get_store)) -> list[str]:
+    return store.all_tags()
 
 
 @router.get("/countries", response_model=list[str])
-def countries(conn: sqlite3.Connection = Depends(get_conn)) -> list[str]:
-    return repository.countries(conn)
+def countries(store: Store = Depends(get_store)) -> list[str]:
+    return store.countries()

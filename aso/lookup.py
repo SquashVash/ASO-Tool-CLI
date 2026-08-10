@@ -3,33 +3,27 @@
 The same thing `aso check` does, packaged for two callers. `lookup_async` is
 the core; the API awaits it directly, so it can hand over the one `Fetcher` its
 process owns. `lookup` wraps it in `asyncio.run` for a caller that cannot use
-asyncio directly — which in practice means Streamlit, whose script model reruns
-the whole module on every widget interaction and offers no event loop of its
-own.
+asyncio directly.
 
-**Why this is a module and not four lines inside `dashboard.py`.** The
-dashboard was built strictly read-only, and one of the two reasons was that a
-dashboard which fires rate-limited requests on every rerun is a good way to get
-403ed mid-refresh. Adding a lookup screen means giving it network access, so the
-protection has to move rather than disappear: the network call lives here, is
-synchronous and explicit, and the dashboard may only reach it from a submitted
-form whose result it caches. Keeping it out of the presentation module is what
-makes that rule testable at all.
+**Why this is a module and not four lines inside the API route.** The scoring
+call is rate-limited against Apple and must stay callable from a caller with no
+event loop of its own, so it lives here rather than in whichever presentation
+layer happens to want it. `lookup` is the synchronous wrapper for that caller;
+`lookup_async` is what the API awaits.
 """
 
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 from dataclasses import dataclass
 
-from . import pipeline, repository
+from . import pipeline
 from .clients.charts import ChartIndex
 from .clients.hints import HintsClient
 from .clients.itunes import ITunesClient
 from .config import settings
-from .db import session
 from .http import Fetcher
+from .store import Store
 
 
 @dataclass(frozen=True)
@@ -51,7 +45,7 @@ class LookupResult:
 
 
 def opportunity_percentile(
-    conn: sqlite3.Connection, score: float | None
+    store: Store, score: float | None
 ) -> tuple[float | None, int]:
     """What fraction of tracked keywords this score beats, as 0-100.
 
@@ -65,7 +59,7 @@ def opportunity_percentile(
     """
     if score is None:
         return None, 0
-    rows = repository.latest_scores(conn, sort="opportunity", include_unscored=False)
+    rows = store.latest_scores(sort="opportunity", include_unscored=False)
     values = [
         row["opportunity_score"]
         for row in rows
@@ -112,22 +106,21 @@ async def lookup_async(
         # A supplied fetcher is long-lived, so its counter is a running total
         # for the process. `requests_made` on the result means this lookup.
         before = active.requests_made
-        with session() as conn:
-            itunes = ITunesClient(active, conn, settings)
-            hints = HintsClient(active, conn, settings)
-            scored = await pipeline.score_keyword(
-                keyword,
-                country,
-                itunes=itunes,
-                hints=hints,
-                force=force,
-                charts=charts,
-            )
-            # An ad-hoc check must report the same demand number a tracked
-            # keyword would. `score_keyword` cannot do this itself — it is
-            # deliberately table-free — so the blend happens here, where
-            # there is a connection.
-            pipeline.blend_outcome(conn, scored.outcome)
+        itunes = ITunesClient(active, config=settings)
+        hints = HintsClient(active, config=settings)
+        scored = await pipeline.score_keyword(
+            keyword,
+            country,
+            itunes=itunes,
+            hints=hints,
+            force=force,
+            charts=charts,
+        )
+        # An ad-hoc check must report the same numbers a tracked keyword
+        # would, on both axes. `score_keyword` cannot do this itself — it
+        # reads no stored data by design — so both adjustments happen here.
+        pipeline.bridge_outcome(scored.outcome)
+        pipeline.blend_outcome(scored.outcome)
         return scored, active.requests_made - before
 
     if fetcher is not None:
@@ -136,11 +129,11 @@ async def lookup_async(
         async with Fetcher(settings) as owned:
             scored, requests_made = await run(owned)
 
-    with session() as conn:
-        existing = repository.get_keyword(conn, keyword, country)
-        percentile, compared = opportunity_percentile(
-            conn, scored.outcome.opportunity_score
-        )
+    store = Store.load()
+    existing = store.get_keyword(keyword, country)
+    percentile, compared = opportunity_percentile(
+        store, scored.outcome.opportunity_score
+    )
 
     return LookupResult(
         scored=scored,
@@ -154,8 +147,7 @@ async def lookup_async(
 def lookup(keyword: str, country: str, *, force: bool = False) -> LookupResult:
     """Synchronous `lookup_async`, for a caller with no event loop to borrow.
 
-    That caller is Streamlit, whose script model reruns the whole module on
-    every widget interaction and offers no loop of its own. Runs its own loop
-    via `asyncio.run`, so it must not be called from inside one.
+    Runs its own loop via `asyncio.run`, so it must not be called from inside
+    one.
     """
     return asyncio.run(lookup_async(keyword, country, force=force))

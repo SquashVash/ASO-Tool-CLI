@@ -5,15 +5,14 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from aso import db, repository as repo
+from aso import calibration, store as store_module
 from aso.api.app import create_app
 
-from .test_repository import days_ago
+from .conftest import days_ago
 
 
 @pytest.fixture
 def client():
-    db.init_db()
     with TestClient(create_app()) as test_client:
         yield test_client
 
@@ -67,21 +66,13 @@ def test_patch_replaces_tags(client):
     assert response.json()["tags"] == ["swing"]
 
 
-def test_delete_reports_the_footprint_it_destroyed(client):
+def test_delete_reports_what_it_removed(client):
+    """A delete says how many keywords went, and nothing else did."""
     keyword_id = client.post(
         "/keywords", json={"keyword": "forex", "country": "us"}
     ).json()["keyword_id"]
-    with db.session() as conn:
-        repo.write_snapshot(
-            conn,
-            repo.SnapshotWrite(
-                keyword_id=keyword_id, captured_at=days_ago(0), opportunity_score=1.0
-            ),
-        )
-
-    response = client.delete(f"/keywords/{keyword_id}")
-    assert response.status_code == 200
-    assert response.json() == {"keywords": 1, "snapshots": 1, "serps": 0}
+    body = client.delete(f"/keywords/{keyword_id}").json()
+    assert body == {"keywords": 1}
     assert client.get(f"/keywords/{keyword_id}").status_code == 404
 
 

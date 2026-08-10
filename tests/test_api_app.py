@@ -8,18 +8,17 @@ import pkgutil
 from fastapi.testclient import TestClient
 
 import aso.api
-from aso import config, db
+from aso import config
 from aso.api.app import create_app
 
 from . import conftest
 
 
-def test_health_reports_schema_and_counts():
-    db.init_db()
-    with db.session() as conn:
-        from aso import repository as repo
+def test_health_reports_counts():
+    from aso import store as store_module
 
-        repo.add_keyword(conn, "forex", "us")
+    with store_module.session() as store:
+        store.add_keyword("forex", "us")
 
     with TestClient(create_app()) as client:
         response = client.get("/health")
@@ -28,7 +27,11 @@ def test_health_reports_schema_and_counts():
     body = response.json()
     assert body["status"] == "ok"
     assert body["keywords"] == 1
-    assert body["schema_version"] > 0
+    assert body["countries"] == ["us"]
+    # The counts are what distinguish a live server from one pointed at an
+    # empty data directory; "ok" alone would not.
+    assert "demand_observations" in body
+    assert "bridges" in body
 
 
 def test_api_defaults_to_loopback():

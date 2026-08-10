@@ -7,15 +7,14 @@ import dataclasses
 import pytest
 from fastapi.testclient import TestClient
 
-from aso import config, db, repository as repo
+from aso import config, store as store_module
 from aso.api.app import create_app
 
 
 @pytest.fixture
 def client():
-    db.init_db()
-    with db.session() as conn:
-        repo.add_keyword(conn, "forex", "us", "lcp")
+    with store_module.session() as store:
+        store.add_keyword("forex", "us", "lcp")
     with TestClient(create_app()) as test_client:
         yield test_client
 
@@ -55,7 +54,7 @@ def test_asa_pull_starts_a_job(client, monkeypatch):
     from aso import pipeline
     from aso.api.routes import jobs as jobs_routes
 
-    async def fake_pull(conn, *, start, end, **kwargs):
+    async def fake_pull(*, start, end, **kwargs):
         return pipeline.ASAPullReport(
             campaigns_seen=1, terms_written=5, start=str(start), end=str(end)
         )
@@ -105,7 +104,7 @@ def test_popularity_pull_job_records_a_readable_error_when_the_browser_extra_is_
         "    uv run playwright install chromium\n"
     )
 
-    async def fake_pull(conn, keywords, *, country, **kwargs):
+    async def fake_pull(keywords, *, country, **kwargs):
         raise ApplePopularityError(message)
 
     monkeypatch.setattr(jobs_routes.pipeline, "pull_apple_popularity", fake_pull)

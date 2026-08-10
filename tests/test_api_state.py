@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from aso import db
 from aso.api.state import AppState
 from aso.clients.charts import ChartIndex
 
@@ -23,10 +22,8 @@ async def test_chart_index_is_built_once_per_country_per_day(monkeypatch):
     monkeypatch.setattr(state_module, "ChartsClient", lambda *a, **kw: charts)
 
     app_state = AppState(fetcher=object())
-    db.init_db()
-    with db.session() as conn:
-        first = await app_state.chart_index(conn, "us")
-        second = await app_state.chart_index(conn, "us")
+    first = await app_state.chart_index("us")
+    second = await app_state.chart_index("us")
 
     assert first is second
     assert charts.calls == 1, "48 chart requests must not be repeated per lookup"
@@ -61,11 +58,9 @@ async def test_an_index_that_loaded_nothing_is_returned_but_not_cached(monkeypat
     monkeypatch.setattr(state_module, "ChartsClient", lambda *a, **kw: charts)
 
     app_state = AppState(fetcher=object())
-    db.init_db()
-    with db.session() as conn:
-        empty = await app_state.chart_index(conn, "us")
-        rebuilt = await app_state.chart_index(conn, "us")
-        cached = await app_state.chart_index(conn, "us")
+    empty = await app_state.chart_index("us")
+    rebuilt = await app_state.chart_index("us")
+    cached = await app_state.chart_index("us")
 
     assert not empty, "the caller still gets an answer, just an empty one"
     assert charts.calls == 2, "the empty index must not have been cached"
@@ -86,9 +81,7 @@ async def test_a_stale_dated_index_is_evicted_when_a_new_day_is_built(monkeypatc
     app_state.chart_indexes[stale] = ChartIndex(
         country="us", ranks={1: 1}, charts_loaded=48
     )
-    db.init_db()
-    with db.session() as conn:
-        await app_state.chart_index(conn, "gb")
+    await app_state.chart_index("gb")
 
     assert stale not in app_state.chart_indexes
     assert len(app_state.chart_indexes) == 1
@@ -101,9 +94,7 @@ async def test_chart_index_is_keyed_by_country(monkeypatch):
     monkeypatch.setattr(state_module, "ChartsClient", lambda *a, **kw: charts)
 
     app_state = AppState(fetcher=object())
-    db.init_db()
-    with db.session() as conn:
-        await app_state.chart_index(conn, "us")
-        await app_state.chart_index(conn, "gb")
+    await app_state.chart_index("us")
+    await app_state.chart_index("gb")
 
     assert charts.calls == 2
