@@ -437,3 +437,14 @@ def test_movers_excludes_inactive_keywords(conn) -> None:
 
 def test_movers_on_an_empty_database(conn) -> None:
     assert repo.score_movers(conn) == []
+
+
+def test_get_keyword_by_id_round_trips(conn):
+    keyword_id, _ = repo.add_keyword(conn, "forex", "us", ["lcp"])
+    row = repo.get_keyword_by_id(conn, keyword_id)
+    assert row["keyword"] == "forex"
+    assert row["country"] == "us"
+
+
+def test_get_keyword_by_id_returns_none_when_absent(conn):
+    assert repo.get_keyword_by_id(conn, 9999) is None

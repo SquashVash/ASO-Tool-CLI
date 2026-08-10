@@ -118,6 +118,17 @@ def get_keyword(
     ).fetchone()
 
 
+def get_keyword_by_id(conn: sqlite3.Connection, keyword_id: int) -> sqlite3.Row | None:
+    """Resolve an id, for callers that address keywords by id rather than text.
+
+    The API does, because keywords contain spaces, unicode, and sometimes '/',
+    which no amount of URL encoding makes pleasant in a path segment.
+    """
+    return conn.execute(
+        "SELECT * FROM keywords WHERE id = ?", (keyword_id,)
+    ).fetchone()
+
+
 def require_keyword(
     conn: sqlite3.Connection, keyword: str, country: str
 ) -> sqlite3.Row:
