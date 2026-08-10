@@ -168,6 +168,20 @@ def set_active(conn: sqlite3.Connection, keyword_id: int, active: bool) -> None:
     )
 
 
+def set_tags(
+    conn: sqlite3.Connection, keyword_id: int, tags: Iterable[str] | str | None
+) -> None:
+    """Replace a keyword's tag set.
+
+    `add_keyword` merges, because re-importing an overlapping CSV must be safe.
+    Replacing is the other half: without it there is no way to remove a tag.
+    """
+    conn.execute(
+        "UPDATE keywords SET tags = ? WHERE id = ?",
+        (normalize_tags(tags), keyword_id),
+    )
+
+
 def keyword_footprint(conn: sqlite3.Connection, keyword_id: int) -> dict[str, int]:
     """How many rows a keyword owns, for showing what a delete would destroy.
 

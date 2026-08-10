@@ -99,6 +99,34 @@ class SerpRow(BaseModel):
         return cls(**{key: row[key] for key in cls.model_fields})
 
 
+class AddKeywordRequest(BaseModel):
+    keyword: str
+    country: str
+    tags: list[str] = []
+
+
+class AddKeywordResponse(BaseModel):
+    keyword_id: int
+    created: bool
+
+
+class PatchKeywordRequest(BaseModel):
+    """Both fields optional; omitted means unchanged.
+
+    `tags` REPLACES the tag set, unlike POST /keywords which merges. A caller
+    that wants to remove a tag has no other way to say so.
+    """
+
+    active: bool | None = None
+    tags: list[str] | None = None
+
+
+class DeleteResponse(BaseModel):
+    keywords: int
+    snapshots: int
+    serps: int
+
+
 class MoverRow(BaseModel):
     """A null delta means *not measured then*, never *did not move*."""
 

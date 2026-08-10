@@ -4,13 +4,24 @@ from __future__ import annotations
 
 import sqlite3
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from ... import repository
 from ...config import COMPETITION_WEIGHTS
+from ...db import transaction
 from ...repository import split_tags
 from ..deps import get_conn
-from ..schemas import ComponentWeight, KeywordDetail, KeywordScore, SerpRow, SnapshotRow
+from ..schemas import (
+    AddKeywordRequest,
+    AddKeywordResponse,
+    ComponentWeight,
+    DeleteResponse,
+    KeywordDetail,
+    KeywordScore,
+    PatchKeywordRequest,
+    SerpRow,
+    SnapshotRow,
+)
 
 router = APIRouter(tags=["keywords"])
 
@@ -114,3 +125,51 @@ def keyword_serp(
 ) -> list[SerpRow]:
     _require_keyword_row(conn, keyword_id)
     return [SerpRow.from_row(row) for row in repository.latest_serp(conn, keyword_id, limit=limit)]
+
+
+@router.post("/keywords", response_model=AddKeywordResponse)
+def add_keyword(
+    body: AddKeywordRequest,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> AddKeywordResponse:
+    """Add a tracked keyword, merging tags into an existing one.
+
+    Merging rather than replacing matches `repository.add_keyword`: re-posting
+    an overlapping set must be safe to repeat.
+    """
+    try:
+        with transaction(conn):
+            keyword_id, created = repository.add_keyword(
+                conn, body.keyword, body.country, body.tags
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    response.status_code = 201 if created else 200
+    return AddKeywordResponse(keyword_id=keyword_id, created=created)
+
+
+@router.patch("/keywords/{keyword_id}", response_model=KeywordDetail)
+def patch_keyword(
+    keyword_id: int,
+    body: PatchKeywordRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> KeywordDetail:
+    _require_keyword_row(conn, keyword_id)
+    with transaction(conn):
+        if body.active is not None:
+            repository.set_active(conn, keyword_id, body.active)
+        if body.tags is not None:
+            repository.set_tags(conn, keyword_id, body.tags)
+    return keyword_detail(keyword_id, conn)
+
+
+@router.delete("/keywords/{keyword_id}", response_model=DeleteResponse)
+def delete_keyword(
+    keyword_id: int, conn: sqlite3.Connection = Depends(get_conn)
+) -> DeleteResponse:
+    """Permanent. Prefer PATCH {"active": false}, which is reversible."""
+    _require_keyword_row(conn, keyword_id)
+    with transaction(conn):
+        counts = repository.delete_keyword(conn, keyword_id)
+    return DeleteResponse(**counts)

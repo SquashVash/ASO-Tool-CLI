@@ -119,6 +119,13 @@ def test_all_tags_and_countries(conn: sqlite3.Connection) -> None:
     assert repo.countries(conn) == ["de", "us"]
 
 
+def test_set_tags_replaces_rather_than_merging(conn):
+    repo.add_keyword(conn, "forex", "us", ["lcp", "swing"])
+    row = repo.require_keyword(conn, "forex", "us")
+    repo.set_tags(conn, row["id"], ["daily"])
+    assert repo.split_tags(repo.require_keyword(conn, "forex", "us")["tags"]) == ["daily"]
+
+
 # --- snapshots -------------------------------------------------------------
 
 
